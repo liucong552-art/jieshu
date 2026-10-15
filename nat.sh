@@ -201,7 +201,7 @@ need_packages(){
   apt-get update -o Acquire::Retries=3 >/dev/null \
     || fail "apt-get update 失败；请检查 ${OS_PRETTY_NAME} 的软件源"
   apt_install_with_universe_retry \
-    "$wg_package" iproute2 iptables curl ca-certificates procps kmod findutils util-linux coreutils
+    "$wg_package" iproute2 iptables curl ca-certificates procps kmod findutils util-linux coreutils iputils-ping
 
   local cmd
   for cmd in wg wg-quick ip iptables curl sysctl modprobe find flock timeout sha256sum; do
@@ -1159,6 +1159,12 @@ cmd_add(){
   systemctl is-active --quiet "wg-exit-firewall@${WG_IF}.timer" || fail "防火墙 watchdog timer 未运行"
   tx_commit
 
+  # NAT add already committed successfully; do not affect existing peers if
+  # this optional probe setup fails (for example on an older host without ping).
+  if ! ( vr_probe_auto_enable "$name" ); then
+    warn "Peer ${name} 已成功添加/更新，但自动探测未启用；检查依赖或重试：bash $0 probe-enable ${name}"
+  fi
+
   vps_local_addr="$(vps_interface_addr_from_peer_addr "$vps_addr")"
   nat_pub="$(cat "$PUB_FILE")"
 
@@ -1198,6 +1204,11 @@ cmd_del(){
   tx_commit
 
   echo "✅ 已删除 Peer：${name}"
+  # Only disable the deleted peer timer; never stop another peer or wg-exit.
+  if ! ( vr_probe_auto_disable "$name" ); then
+    warn "Peer ${name} 已成功删除，但其探测任务未确认停止；请检查对应定时器"
+  fi
+
 }
 
 cmd_list(){
@@ -1299,7 +1310,7 @@ ConditionPathExists=/sys/class/net/${WG_IF}
 
 [Service]
 Type=oneshot
-ExecStart=${helper} ${WG_IF} %i
+ExecStart=${helper} ${WG_IF} %I
 EOF_VR_PEER_SERVICE
   cat > "$timer" <<'EOF_VR_PEER_TIMER'
 [Unit]
@@ -1319,6 +1330,33 @@ EOF_VR_PEER_TIMER
     systemd-analyze verify "$service" "$timer" >/dev/null || fail "Peer 探测 unit 校验失败"
   fi
 }
+# V3.2: Peer probe lifecycle helpers. The main WG transaction is already
+# committed when these run. A probe error must never roll back a working peer.
+vr_probe_auto_enable(){
+  local name="$1" unit
+  if ! command -v ping >/dev/null 2>&1; then
+    warn "缺少 ping (iputils-ping)；Peer 已添加，但探测尚未启用。请先安装 iputils-ping，再运行：bash $0 probe-enable ${name}"
+    return 1
+  fi
+  vr_probe_require_peer "$name" || return 1
+  vr_probe_write_files || return 1
+  unit="$(vr_probe_unit "$name")" || return 1
+  systemctl enable --now "$unit" || return 1
+  echo "✅ Peer ${name} 自动握手探测已启用（不重启 WG 接口）"
+}
+vr_probe_auto_disable(){
+  local name="$1" unit
+  unit="$(vr_probe_unit "$name")" || return 1
+  # Old peers can have no timer; disabling a missing timer is still success.
+  systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  if systemctl is-active --quiet "$unit" 2>/dev/null \
+    || systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+    warn "无法关闭 Peer ${name} 的探测任务：${unit}"
+    return 1
+  fi
+  return 0
+}
+
 cmd_probe_enable(){
   local name="$1" unit
   vr_probe_require_peer "$name"
@@ -1331,7 +1369,7 @@ cmd_probe_disable(){
   local name="$1" unit
   validate_name "$name"
   unit="$(vr_probe_unit "$name")"
-  systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  vr_probe_auto_disable "$name" || fail "停止 Peer 探测失败：${name}"
   echo "✅ 已停止 ${name} 的 WireGuard 探测；隧道配置保持不变"
 }
 cmd_probe_once(){
