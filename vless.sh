@@ -4863,6 +4863,129 @@ echo "V3_WATCHDOG_TEMP_LOCK_ACQUIRED: waited ${SECONDS}s" >&2
 rc=0
 now="$(date +%s)"
 
+# V3.2-test: only genuine, verified recovery clears a failure grace.
+# Third failed watchdog repair starts one persistent 72-hour grace interval.
+# Intermittent systemd restarts or reboots must not reset the clock.
+WD_GRACE_SECONDS=259200
+
+wd_failure_count() {
+  local value
+  value="$(vr_meta_get "$1" WATCHDOG_FAILURES 2>/dev/null || true)"
+  if [[ "$value" =~ ^[0-9]+$ && ${#value} -le 10 ]]; then
+    printf '%s\n' "$((10#$value))"
+  else
+    printf '0\n'
+  fi
+}
+
+wd_grace_start() {
+  local value
+  value="$(vr_meta_get "$1" WATCHDOG_GRACE_START_EPOCH 2>/dev/null || true)"
+  if [[ "$value" =~ ^[0-9]+$ && ${#value} -le 12 ]]; then
+    printf '%s\n' "$((10#$value))"
+  else
+    printf '0\n'
+  fi
+}
+
+wd_clear_failure_state() {
+  local meta="$1"
+  # Order matters: clear the removal clock before clearing the failure count.
+  # If this process dies between writes it can only be more conservative.
+  vr_meta_upsert "$meta" WATCHDOG_GRACE_START_EPOCH 0
+  vr_meta_upsert "$meta" WATCHDOG_FAILURES 0
+  vr_meta_upsert "$meta" WATCHDOG_LAST_FAILURE_EPOCH 0
+}
+
+wd_final_boot_ready() {
+  # Give WireGuard and NAT peer reconnection enough time after a cold boot.
+  # Cold-boot captures have shown up to ~134s to obtain a fresh handshake.
+  local uptime ignored
+  read -r uptime ignored </proc/uptime || return 1
+  [[ "$uptime" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  (( ${uptime%%.*} >= 300 ))
+}
+
+wd_record_failed_recovery() {
+  local meta="$1" tag="$2" reason="$3"
+  local failures start created
+  failures="$(wd_failure_count "$meta")"
+  if (( failures < 3 )); then
+    failures=$(( failures + 1 ))
+    vr_meta_upsert "$meta" WATCHDOG_FAILURES "$failures"
+  fi
+  # If the third failure was persisted immediately before a crash, the next
+  # check initializes its 72-hour start. Never infer an earlier timestamp.
+  if (( failures >= 3 )); then
+    start="$(wd_grace_start "$meta")"
+    # Reject a stale/corrupted timer dated earlier than this node's creation.
+    created="$(vr_meta_get "$meta" CREATE_EPOCH 2>/dev/null || true)"
+    if [[ "$created" =~ ^[0-9]+$ && ${#created} -le 12 ]]; then
+      if (( start > 0 && start < 10#$created )); then
+        echo "V32_WATCHDOG_INVALID_GRACE: ${tag} grace predates creation; starting safe new grace" >&2
+        start=0
+      fi
+    fi
+    if (( start == 0 )); then
+      start="$now"
+      vr_meta_upsert "$meta" WATCHDOG_GRACE_START_EPOCH "$start"
+      echo "V32_WATCHDOG_GRACE_STARTED: ${tag} start=${start} deadline=$((start + WD_GRACE_SECONDS))" >&2
+    fi
+  fi
+  vr_meta_upsert "$meta" WATCHDOG_LAST_FAILURE_EPOCH "$now"
+  if (( failures >= 3 )); then
+    if (( now >= start && now - start >= WD_GRACE_SECONDS )); then
+      if ! wd_final_boot_ready; then
+        echo "V32_WATCHDOG_FINAL_DEFERRED: ${tag} waiting for 300s boot stabilization" >&2
+        rc=1
+        return 0
+      fi
+      echo "V32_WATCHDOG_FINAL_FAILURE: ${tag} reason=${reason}; grace_elapsed=$((now - start))s; deleting" >&2
+      FORCE=1 VR_TEMP_LOCK_HELD=1 /usr/local/sbin/vless_cleanup_one.sh "$tag" || rc=1
+    else
+      echo "V32_WATCHDOG_GRACE_ACTIVE: ${tag} reason=${reason}; deadline=$((start + WD_GRACE_SECONDS))" >&2
+      rc=1
+    fi
+  else
+    echo "V32_WATCHDOG_RECOVERY_FAILED: ${tag} attempt=${failures} reason=${reason}" >&2
+    rc=1
+  fi
+}
+
+wd_protection_healthy() {
+  local port="$1" ip_limit="$2" pq_limit="$3"
+  if [[ -n "$pq_limit" ]]; then
+    [[ "$pq_limit" =~ ^[0-9]+$ && ${#pq_limit} -le 19 ]] || return 1
+    (( pq_limit > 0 )) || return 1
+    case "$(vr_pq_state "$port")" in active|exhausted) ;; *) return 1 ;; esac
+  fi
+  if (( ip_limit > 0 )); then
+    [[ "$(vr_il_state "$port")" == "active" ]]
+  else
+    [[ "$(vr_il_family_guard_state "$port")" == "active" ]]
+  fi
+}
+
+wd_node_healthy() {
+  local tag="$1" port="$2" meta="$3" landing="$4"
+  local wg_if mark handshake_max hs route_result
+  systemctl is-active --quiet "${tag}.service" || return 1
+  vr_port_is_listening "$port" || return 1
+  if [[ "$landing" == "nat" ]]; then
+    wg_if="$(vr_meta_get "$meta" WG_IF 2>/dev/null || true)"
+    mark="$(vr_meta_get "$meta" MARK 2>/dev/null || true)"
+    handshake_max="$(vr_meta_get "$meta" HANDSHAKE_MAX 2>/dev/null || true)"
+    handshake_max="${handshake_max:-180}"
+    [[ -n "$wg_if" && "$mark" =~ ^[0-9]+$ && "$handshake_max" =~ ^[0-9]+$ ]] || return 1
+    systemctl is-active --quiet "wg-quick@${wg_if}.service" || return 1
+    route_result="$(ip route get 1.1.1.1 mark "$mark" 2>/dev/null || true)"
+    grep -qE "\bdev ${wg_if}\b" <<<"$route_result" || return 1
+    hs="$(wg show "$wg_if" latest-handshakes 2>/dev/null | awk 'NF>=2{print $2}' | sort -nr | head -n1 || true)"
+    [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 && now >= hs && now - hs <= handshake_max )) || return 1
+  fi
+  return 0
+}
+
 stop_temp_listener_failclosed() {
   local tag="$1"
   vr_is_valid_temp_tag "$tag" || return 1
@@ -4963,59 +5086,38 @@ for meta in "$VR_TEMP_STATE_DIR"/*.env; do
       vr_pq_unlock
     fi
     stop_temp_listener_failclosed "$tag" || true
-    rc=1
+    wd_record_failed_recovery "$meta" "$tag" "guard_unavailable"
     continue
   fi
 
-  node_healthy=0
-  if systemctl is-active --quiet "${tag}.service" && vr_port_is_listening "$port"; then
-    node_healthy=1
-  fi
   landing="$(vr_meta_get "$meta" LANDING 2>/dev/null || true)"
-  if (( node_healthy == 1 )) && [[ "$landing" == "nat" ]]; then
-    wg_if="$(vr_meta_get "$meta" WG_IF 2>/dev/null || true)"
-    mark="$(vr_meta_get "$meta" MARK 2>/dev/null || true)"
-    handshake_max="$(vr_meta_get "$meta" HANDSHAKE_MAX 2>/dev/null || true)"
-    handshake_max="${handshake_max:-180}"
-    hs=""
-    [[ -n "$wg_if" && "$mark" =~ ^[0-9]+$ && "$handshake_max" =~ ^[0-9]+$ ]] || node_healthy=0
-    if (( node_healthy == 1 )); then
-      systemctl is-active --quiet "wg-quick@${wg_if}.service" || node_healthy=0
-      route_result="$(ip route get 1.1.1.1 mark "$mark" 2>/dev/null || true)"
-      grep -qE "\bdev ${wg_if}\b" <<<"$route_result" || node_healthy=0
-      hs="$(wg show "$wg_if" latest-handshakes 2>/dev/null | awk 'NF>=2{print $2}' | sort -nr | head -n1 || true)"
-      [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 && now - hs <= handshake_max )) || node_healthy=0
-    fi
-  fi
-
-  if (( node_healthy == 1 )); then
-    if [[ "$(vr_meta_get "$meta" WATCHDOG_FAILURES 2>/dev/null || true)" != "0" ]]; then
-      vr_meta_upsert "$meta" WATCHDOG_FAILURES 0
+  if wd_node_healthy "$tag" "$port" "$meta" "$landing"; then
+    # Stale grace markers must also be cleared, even if failures was reset.
+    if [[ "$(vr_meta_get "$meta" WATCHDOG_FAILURES 2>/dev/null || true)" != "0" \
+          || "$(wd_grace_start "$meta")" != "0" ]]; then
+      wd_clear_failure_state "$meta"
     fi
     continue
   fi
 
-  echo "⚠️  临时节点 ${tag} 未运行，尝试恢复" >&2
+  echo "⚠️  临时节点 ${tag} 未健康，尝试恢复" >&2
   systemctl reset-failed "${tag}.service" >/dev/null 2>&1 || true
+  restarted=0
   if systemctl restart "${tag}.service" >/dev/null 2>&1 \
-    && vr_wait_unit_and_port "${tag}.service" "$port" 2 8
-  then
-    vr_meta_upsert "$meta" WATCHDOG_FAILURES 0
-    vr_meta_upsert "$meta" WATCHDOG_LAST_FAILURE_EPOCH 0
+    && vr_wait_unit_and_port "${tag}.service" "$port" 2 8; then
+    restarted=1
+  fi
+  # A running Xray process is NOT proof that NAT handshake and guard worked.
+  if (( restarted == 1 )) && wd_protection_healthy "$port" "$ip_limit" "$pq_limit" \
+    && wd_node_healthy "$tag" "$port" "$meta" "$landing"; then
+    wd_clear_failure_state "$meta"
     continue
   fi
-
-  failures="$(vr_meta_get "$meta" WATCHDOG_FAILURES 2>/dev/null || true)"
-  [[ "$failures" =~ ^[0-9]+$ ]] || failures=0
-  failures=$((failures + 1))
-  vr_meta_upsert "$meta" WATCHDOG_FAILURES "$failures"
-  vr_meta_upsert "$meta" WATCHDOG_LAST_FAILURE_EPOCH "$now"
-  if (( failures >= 3 )); then
-    echo "❌ 临时节点 ${tag} 连续恢复失败 ${failures} 次，执行清理" >&2
-    FORCE=1 VR_TEMP_LOCK_HELD=1 /usr/local/sbin/vless_cleanup_one.sh "$tag" || rc=1
-  else
-    rc=1
+  # Fail closed if a listener started but the NAT tunnel is not healthy.
+  if [[ "$landing" == "nat" ]]; then
+    stop_temp_listener_failclosed "$tag" || true
   fi
+  wd_record_failed_recovery "$meta" "$tag" "restart_or_healthcheck_failed"
 done
 
 # 每轮都重建聚合订阅；即使节点本身无变化，外部误删/截断订阅文件也能自愈。
