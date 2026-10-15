@@ -1,18 +1,20 @@
-# VLESS Reality 临时节点与 WG-NAT
+# VLESS Reality / WG-NAT / SOCKS5 安装与使用手册
 
-面向使用者的安装与日常管理说明。项目包含主 VLESS Reality 节点、普通临时节点、流量/IP 限制，以及可选的 WG-NAT 出口。
+本仓库固定保留 **11 个文件**。这份说明按照新手实际操作顺序编排，复制命令前先确认自己处于哪台服务器。
 
-| 脚本 | 运行位置 | 用途 |
+| 文件 | 运行位置 | 用途 |
 |---|---|---|
-| `vless.sh` | VLESS VPS | 安装主节点与普通临时节点管理工具 |
+| `vless.sh` | VLESS VPS | 安装主节点和普通临时节点 |
 | `vpswg.sh` | VLESS VPS | 配置 WG-NAT 的 VPS 端 |
-| `nat.sh` | NAT 出口机 | 配置并管理 NAT 出口 |
+| `nat.sh` | NAT 出口机 | 配置和管理多个 VPS 共用的 NAT 出口 |
 | `natjichang.sh` | VLESS VPS | 安装 WG-NAT 临时节点工具 |
-| `traffic.py` | VLESS VPS | 可选：记录每日流量，保留最近 30 个自然日 |
-| `portbw-install.sh`、`portbw.py` | VLESS VPS | 可选：按端口独立设置 TCP+UDP 共用上传/下载限速 |
+| `traffic.py` | VLESS VPS | 可选：每日流量统计 |
+| `portbw-install.sh`、`portbw.py` | 要限速的服务器 | 可选：按端口限速 |
+| `socks5-install.sh`、`socks5.py`、`socks5-traffic.py` | 独立 SOCKS5 主机 | 可选：SOCKS5 账号管理和流量统计 |
 
-> `natjichang.sh` 运行在 VLESS VPS，不是在 NAT 出口机。
+**按需求查看：** 只用 VLESS：第一～四节；使用另一个 NAT 出口：第五节；更新与排查：第六～七节；独立 SOCKS5：第八节；生产安全提醒：第九节。
 
+> `nat.sh` 仅在 NAT 出口机运行。`vpswg.sh` 和 `natjichang.sh` 仅在 VLESS VPS 运行。不要在客户共用的 NAT 机器上直接试运行 `init/add/del`：它们会重启 WG 接口。
 ## 使用前准备
 
 - Debian 11+ 或 Ubuntu 20.04+
@@ -29,7 +31,7 @@
 在 **VLESS VPS** 执行：
 
 ```bash
-apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/vless.sh')
+apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vless.sh')
 ```
 
 ### 2. 修改配置
@@ -277,7 +279,7 @@ PORT=40000; ss -Htn state established "( sport = :$PORT )"
 #### 安装
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
 ```
 
 #### 使用方法
@@ -341,16 +343,30 @@ portbw report           # 一键查看所有静态、自动限速端口（中文
 
 查看当前上传/下载、正常速度、自动降速值、触发阈值、持续时间、滚动保护、冷却时间及规则状态，单位为 **Mbps**。静态端口不适用的参数显示 `-`；终端较窄时优先保留限速参数。此命令**只读**，不会改变限速或保护计时。安装 `portbw` 后即可使用。
 
-#### 一键安装 / 更新
+#### 安装 / 更新 portbw（需要同时下载两个文件）
 
-在 **VLESS VPS** 以 root 执行（不会修改 Xray、WireGuard、已有 nft 表及 root `fq` qdisc）：
+**首次安装：** 在要限速的服务器上以 **root** 逐行执行。新版 `portbw-install.sh` 不自动联网获取 `portbw.py`，也不自动安装缺失的系统依赖，因此下面每一步都要保留。
 
 ```bash
-apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/portbw-install.sh')
+apt-get update && apt-get install -y curl ca-certificates python3 iproute2 nftables util-linux coreutils procps
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/portbw-install.sh' -o /root/portbw-install.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/portbw.py' -o /root/portbw.py
+bash /root/portbw-install.sh check
+bash /root/portbw-install.sh install
+portbw report
 ```
 
-安装器从**本正式仓库**下载 `portbw.py`、校验 SHA256 与 Python 语法，自动识别物理出口网卡，安装开机自动恢复服务和约每 1 秒自检定时器。也可以将 `portbw-install.sh` 与 `portbw.py` 放在同一目录，通过 `bash portbw-install.sh` 本地安装。
+`check` 是只读检查。**如果显示失败，先排查，不要跳过检查强行安装。** 如需手动指定物理网卡，可先运行 `ip -4 route get 1.1.1.1` 查看，再在 `check` 和 `install` 后分别加 `--iface eth0`（`eth0` 替换为真实网卡）。
 
+**升级已由本系列安装器管理的 v1/v2 版：** 先重新下载上述两个文件，然后在维护窗口执行（不要重复使用首次安装命令）：
+
+```bash
+bash /root/portbw-install.sh upgrade
+bash /root/portbw-install.sh verify
+portbw report
+```
+
+升级工具只接受已知受管理版本。检测到其他旧版或其他来源的 nftables/tc 规则时会拒绝覆盖。需要时先记录 `portbw report` 输出；不要手动执行 `nft flush ruleset` 或删除网卡 root qdisc。升级器会保存备份，确需回滚时才执行 `bash /root/portbw-install.sh rollback`。
 #### 静态限速：设置、修改、取消
 
 ```bash
@@ -431,9 +447,8 @@ TZ=Asia/Shanghai journalctl -u portbw-watch.service \
 
 其中 `up` 表示上传方向，`down` 表示下载方向。日志可能包含参数修改**之前**的历史记录；例如旧版显示 `自动降速 15 Mbps / 恢复基础速度 30 Mbps`，不代表现在仍使用旧限速。**当前配置请以 `portbw report` 和 `portbw audit` 为准。** 没有触发日志，也不代表基础限速失效；历史保存时长受 `systemd-journald` 的自动轮替、磁盘容量和保留策略影响。
 
-**旧版升级注意：** 本次升级改变了 tc flower 的协议槽位（从 TCP 专用改为 TCP+UDP 双协议）和保存的 `tc_prefs` 格式。**已使用旧版 `portbw` 创建策略的 VPS 不能保证直接无中断升级**。升级前先用旧版查询功能记录所有端口及速率；如需迁移，请在维护时段用**旧版** `portbw del <端口>` 逐个取消旧策略，确认旧 tc/nft 规则已清除后再运行上述新安装器，最后按记录重新执行 `portbw set`。取消到重建之间，该端口暂不受 portbw 限制。**不要手动 `nft flush ruleset` 或删除网卡 root qdisc**；发现旧规则残留应先检查，不要强制清理其他业务的规则。未安装过 portbw 的全新 VPS 可直接安装。
+**旧版限速迁移注意：** 本次升级改变了 tc flower 的协议槽位（从 TCP 专用改为 TCP+UDP 双协议）和保存的 `tc_prefs` 格式。**已使用旧版 `portbw` 创建策略的 VPS 不能保证直接无中断升级**。升级前先用旧版查询功能记录所有端口及速率；如需迁移，请在维护时段用**旧版** `portbw del <端口>` 逐个取消旧策略，确认旧 tc/nft 规则已清除后再运行上述新安装器，最后按记录重新执行 `portbw set`。取消到重建之间，该端口暂不受 portbw 限制。**不要手动 `nft flush ruleset` 或删除网卡 root qdisc**；发现旧规则残留应先检查，不要强制清理其他业务的规则。未安装过 portbw 的全新 VPS 可直接安装。
 
-**验收范围：** Debian 12 / `eth0` 上，IPv4 单协议、TCP+UDP 双向混合共享速率、反复修改/删除/重建、重启恢复，以及原始快照全新安装均已实测通过；该实测 VPS 未配置公网 IPv6，因此 IPv6 规则虽通过配置审计，但**没有 IPv6 实际测速结论**。不同发行版和网卡环境仍应进行自己的验收。
 
 ## 五、部署 WG-NAT
 
@@ -444,7 +459,7 @@ WG-NAT 让 VLESS VPS 上的指定临时节点通过另一台机器的公网 IPv4
 在 **NAT 出口机** 执行：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
 ```
 
 无法识别公网网卡时：
@@ -458,7 +473,7 @@ WAN_IF=eth0 bash /root/nat.sh init
 在 **VLESS VPS** 执行：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
 ```
 
 脚本会输出 VPS WireGuard 公钥。以后忘记时，在 **VLESS VPS** 查询：
@@ -481,7 +496,7 @@ bash /root/nat.sh add hy2 hy2.example.com '这里替换成VPS公钥'
 - `hy2.example.com`：VLESS VPS 的公网 IPv4 域名，也可以直接填写公网 IPv4。
 - `'这里替换成VPS公钥'`：在 VLESS VPS 执行 `cat /etc/wireguard/wg-nat.pub` 得到的公钥。
 
-NAT 机会自动分配 WG 地址，并打印一条完整的 VPS 回填命令。
+NAT 机会自动分配 WG 地址，并打印一条完整的 VPS 回填命令；新增或更新 Peer 时也会自动启用该 Peer 的握手探测。**共享 NAT 注意：add 会重启整个 WG 接口，其他 VPS 可能短暂断线，请选择维护窗口。**
 
 ### 4. 回到 VPS 执行回填命令
 
@@ -510,7 +525,7 @@ OK EXIT_IP=x.x.x.x
 在 **VLESS VPS** 执行：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
 ```
 
 ### NAT 出口机管理
@@ -541,7 +556,7 @@ bash /root/nat.sh status
 bash /root/nat.sh del hy2
 ```
 
-`hy2` 只是示例。删除前先执行 `bash /root/nat.sh list`，复制需要删除的实际名称。
+`hy2` 只是示例。删除前先执行 `bash /root/nat.sh list`，复制需要删除的实际名称。删除时会停用对应探测，但会重启整个 WG 接口，其他 VPS 可能短暂断线。
 
 #### 更新 VPS 的域名、IP 或公钥
 
@@ -551,7 +566,7 @@ bash /root/nat.sh del hy2
 bash /root/nat.sh add hy2 hy2.example.com '当前VPS公钥'
 ```
 
-同名 `add` 会更新该 VPS 的连接信息，并保留原来分配的 WG 地址。VPS 公钥可在 VLESS VPS 执行以下命令重新查询：
+同名 `add` 会更新该 VPS 的连接信息，并保留原来分配的 WG 地址；更新时整个 WG 接口仍会重启。VPS 公钥可在 VLESS VPS 执行以下命令重新查询：
 
 ```bash
 cat /etc/wireguard/wg-nat.pub
@@ -572,7 +587,7 @@ cat /etc/wireguard/wg-exit.pub
 ### VLESS 管理工具
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/vless.sh' -o /root/vless.sh && chmod 700 /root/vless.sh && bash /root/vless.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vless.sh' -o /root/vless.sh && chmod 700 /root/vless.sh && bash /root/vless.sh
 ```
 
 需要更新 Xray 主程序或重新应用主配置时：
@@ -586,7 +601,7 @@ bash /root/onekey_reality_ipv4.sh
 已安装统计组件时，在 **VLESS VPS** 重新执行以下命令即可更新：
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
 ```
 
 无需删除历史数据，也无需重新安装主脚本。更新后运行 `vless_traffic`，标题应显示“今日”；运行 `vless_traffic main` 可查看主节点保留的每日明细。
@@ -594,14 +609,25 @@ curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/h
 ### VLESS VPS 的 WG-NAT 工具
 
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
 ```
 
 ### NAT 出口机
 
+**旧 NAT 机升级前先备份：** 在 NAT 出口机执行以下命令（备份包含 WG 私钥，切勿公开上传），然后安排维护窗口：
+
 ```bash
-curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
+umask 077
+mkdir -p /root/wg-backups
+BACKUP_TS=$(date +%Y%m%d-%H%M%S)
+tar -C /etc -czf "/root/wg-backups/wireguard-${BACKUP_TS}.tar.gz" wireguard
+iptables-save > "/root/wg-backups/iptables-${BACKUP_TS}.rules"
+```
+
+以下命令更新脚本并重新初始化 WG，会使连接短暂中断：
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
 ```
 
 ## 七、常见排查
@@ -658,11 +684,6 @@ ip -6 addr show scope global
 bash /root/nat.sh status
 ```
 
----
-
-请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。
-
-
 ## 八、可选：独立 SOCKS5 代理（3proxy）
 
 在**单独的家宽主机**上用 `root` 安装，与 VLESS VPS 分开。Debian 12 已完成真机验收；Debian 13 和 Ubuntu 22.04/24.04 LTS 在代码依赖上可能兼容，但尚未完成真机验收。
@@ -673,7 +694,7 @@ bash /root/nat.sh status
 
 ```bash
 apt-get update && apt-get install -y curl ca-certificates
-AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main/socks5-install.sh') install
+AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/socks5-install.sh') install
 ```
 
 主机位于路由器 NAT 后面时，可以在 `install` 后加 `--host proxy.example.com`（换成自己的公网域名/IP）。必要时加 `--wan-if eth0` 指定物理出口网卡。
@@ -770,36 +791,26 @@ SOCKS5 与 VLESS 使用**同一套独立 `portbw` 限速方法**，无需重复�
 
 **注意：** 如果路由器把公网端口 `51004` 映射到家宽主机的 `41004`，限速应设置在本机端口 **`41004`**，不是公网端口 `51004`。SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按本机端口管理 TCP+UDP。SOCKS5 账号创建、到期、删除均不会自动增删 `portbw` 规则；升级 `portbw` 也不会修改 SOCKS5 账号、配额和服务。已安装旧版 `portbw` 的主机先参考前文“旧版升级注意”迁移规则。
 
+## 九、V3.2 运行规则及生产升级注意事项
 
-## V3.2 测试整合版（保留原有 11 个文件名）
+- **临时节点看门狗：** 连续第三次恢复失败后启动持久化的 72 小时宽限；宽限期内恢复健康，原 UUID、端口、到期时间不变，并取消倒计时。
+- **宽限届满：** 最终重试依旧失败就按规则删除临时节点，即使当时 NAT 出口整体不可达也不豁免。自然到期节点按正常到期规则清理。
+- **NAT 握手探测：** 新增/更新 Peer 自动开启单 Peer 定时探测，删除 Peer 自动关闭。以前就存在的旧 Peer，不会因你只更新 GitHub 文件而自动开启。
+- **生产 NAT：** `nat.sh init/add/del` 均可能重启整条 WG 接口，影响其他 VPS；必须备份、安排维护窗口并确认回滚方法，不可当作无中断热更新。
 
-这个候选版修改三个原有文件：`vless.sh`、`nat.sh`、`README.md`。`portbw-install.sh`
-和 `portbw.py` 保留原 `jieshu` 的优化版本；其余文件取自 `zuizhongheji`。
+### 单独查看或控制某台 VPS 的探测（可选）
 
-### 看门狗故障清理
-
-- 第三次修复失败不立即删除，开始持久化的 72 小时宽限期。
-- 宽限期内真正恢复健康后清除故障计数和期限；进程启动成功但 WG
-  握手或防护不正常，不算恢复。
-- 第三次失败后满 72 小时，若最终重试仍失败则强制删除，NAT 整体断网也不豁免。
-- 节点自然到期仍由原 GC 清理。服务器开机的头 300 秒不执行三天后的最终删除。
-
-### NAT 端 WireGuard 单 Peer 握手恢复试验
-
-`nat.sh` 在原有 init/add/del/list/status 之外新增以下**自愿启用**命令：
+下列命令在 **NAT 出口机** 执行。先运行 `bash /root/nat.sh list` 确认名称，把示例 `hy2` 换成实际 Peer 名：
 
 ```bash
-bash nat.sh probe-once helan        # 对对应 Peer 发送一次数据探测
-bash nat.sh probe-enable helan      # 仅对该 Peer 每约 10 秒发送探测数据
-bash nat.sh probe-status helan      # 查看定时器
-bash nat.sh probe-disable helan     # 随时停止探测
+bash /root/nat.sh probe-once hy2        # 立即发送一次探测
+bash /root/nat.sh probe-status hy2      # 查看探测定时器
+bash /root/nat.sh probe-enable hy2      # 手动为旧 Peer 开启探测
+bash /root/nat.sh probe-disable hy2     # 手动停止指定 Peer 探测
 ```
 
-这里的 `helan` 是 nat.sh 中 `add` 使用的 Peer 名称，请根据实际名称填写。
-启用前 NAT 机器需要安装 `iputils-ping`。本功能不修改 WG 密钥、端点、路由、
-防火墙，不重启 wg-exit，也不会向其他 Peer 发送探测。
-会在 NAT 机器本地生成一个 worker 和 systemd 定时器；这些不是 GitHub 仓库文件。
+探测命令本身不会重启 WG，也不会主动修改其他 Peer。新添加 Peer 已自动启用，无需再手动执行 `probe-enable`。
 
-**重要：** 单 Peer 发送数据包能否将重启后的重新握手延迟稳定从约 130 秒
-缩短，仍需要在 helan 上双端抓包 A/B 实验确认。当前是候选修复，不能声明
-WireGuard 冷启动问题已经彻底解决。暂勿覆盖生产机器上的 V3.1。
+---
+
+请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。

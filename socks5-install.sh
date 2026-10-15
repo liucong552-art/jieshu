@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Standalone SOCKS5 installer for zuizhongheji production repo; no portbw or VLESS changes.
+# Standalone SOCKS5 installer for jieshu production repo; no portbw or VLESS changes.
 set -Eeuo pipefail
 umask 077
 [[ ${EUID:-999} -eq 0 ]] || { echo '请使用 root' >&2; exit 1; }
@@ -11,7 +11,7 @@ case "$ACTION" in
   *) echo '用法：bash socks5-install.sh install --wan-if eth0 --host 1.2.3.4 | update | deps' >&2;exit 2;;
 esac
 
-# Sources may be next to the local installer, or fetched from zuizhongheji/main.
+# Sources may be next to the local installer, or fetched from jieshu/main.
 # SHA256 pinning prevents mixing a new installer with an old manager.
 FETCH_DIR=''
 fetch_cleanup(){
@@ -25,11 +25,11 @@ if [[ "$ACTION" != deps ]];then
     command -v curl >/dev/null || { echo '缺少 curl；请先安装 curl ca-certificates' >&2;exit 1; }
     FETCH_DIR="$(mktemp -d /tmp/socks5-source.XXXXXXXX)"
     chmod 0700 "$FETCH_DIR"
-    RAW='https://raw.githubusercontent.com/liucong552-art/zuizhongheji/refs/heads/main'
+    RAW='https://raw.githubusercontent.com/liucong552-art/jieshu/main'
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5.py" -o "$FETCH_DIR/socks5.py"
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5-traffic.py" -o "$FETCH_DIR/socks5-traffic.py"
     SRC_DIR="$FETCH_DIR"
-    echo '[socks5] 从 zuizhongheji/main 下载 SOCKS5 两个主体文件...'
+    echo '[socks5] 从 jieshu/main 下载 SOCKS5 两个主体文件...'
   fi
   expected_core="13989ec8cb103a5d34141b32b41bc6f7d98e27ce13f2bb003b9dbcc94b342aa8"
   expected_traffic="134bcd2a2ee8947bcad3bad09c6f0d50ea5474249701758c514a2294274deb23"
