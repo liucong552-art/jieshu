@@ -219,6 +219,10 @@ add chain inet {TABLE} outbound {{ type filter hook output priority -5; policy a
     else:
         chains=_check_owned_table(items,allow_missing=True)
         missing=set(CHAIN.values())-set(chains)
+        if not missing:
+            # This exact snapshot has already passed every global ownership and
+            # chain check; a second nft dump cannot strengthen that validation.
+            return items
         if missing:
             # Repair only genuinely missing owned chains. Never flush or replace others.
             script=''.join(f'add chain inet {TABLE} {name} {{ type filter hook '
@@ -307,10 +311,11 @@ def _rule_exact(rule,port,d,kind):
         return d=='up' and _named_ref(expr[2],'limit')==limitname(d,port) and expr[3]=={'drop':None}
     return _named_ref(expr[2],'counter')==countname(d,port)
 
-def nft_ok(port,rec,items=None):
+def nft_ok(port,rec,items=None,*,validated=False):
     try:
         if items is None:items=nft_snapshot()
-        validate_base(items)  # Includes isolation: no foreign rule in our chains.
+        if not validated:
+            validate_base(items)  # Includes isolation: no foreign rule in our chains.
         rules,objects=owned(items,port)
         desired=expected_comments(port,rec)
         rows=[x['rule'] for x in items if 'rule' in x and str(x['rule'].get('comment','')).startswith(f'pbw-{port}-')]
@@ -731,13 +736,23 @@ def tc_gc_unbound_police(port,index):
         time.sleep(0.25)
 
 
+def _tc_pref_groups(rows):
+    """Parse priorities once for a snapshot without discarding duplicate slots."""
+    groups={}
+    for row in rows:
+        try:pref=int(row['pref'])
+        except (ValueError,TypeError,KeyError):continue
+        if 1<=pref<=65535:groups.setdefault(pref,[]).append(row)
+    return groups
+
+
 def tc_snapshot(iface):
     # One coherent read pass per audit/watch invocation, not per customer port.
-    return {
-        'qdiscs':tc_qdiscs(iface),
-        'rows':{d:tc_filters(iface,d) for d in ('ingress','egress')},
-        'text':{d:run(['tc','-s','filter','show','dev',iface,d]) for d in ('ingress','egress')},
-    }
+    qdiscs=tc_qdiscs(iface)
+    rows={d:tc_filters(iface,d) for d in ('ingress','egress')}
+    text={d:run(['tc','-s','filter','show','dev',iface,d]) for d in ('ingress','egress')}
+    return {'qdiscs':qdiscs,'rows':rows,'text':text,
+            'pref_groups':{d:_tc_pref_groups(rows[d]) for d in rows}}
 
 def tc_ok(port,rec,iface,snap=None):
     try:
@@ -745,12 +760,21 @@ def tc_ok(port,rec,iface,snap=None):
         for direction in CHAIN:
             tcdir='ingress' if direction=='up' else 'egress'
             rows=snap['rows'][tcdir] if snap else tc_filters(iface,tcdir)
+            groups=snap.get('pref_groups',{}).get(tcdir) if snap else None
+            if groups is None:groups=_tc_pref_groups(rows)
             targets=[]
             for family in FAMILIES:
                 for transport in TRANSPORTS:
                     pref=tc_pref(port,family,transport,rec)
-                    if pref in _used_tc_prefs(rows,port,direction,family,transport):return False
-                    entry=tc_find(iface,port,direction,family,transport,rec,rows,strict=rec[direction]>0)
+                    slot_rows=groups.get(pref,[])
+                    if slot_rows:
+                        # Same foreign-slot rule as _used_tc_prefs, but O(1)
+                        # lookup instead of rebuilding all preferences 8x/port.
+                        details=[r for r in slot_rows if isinstance(r.get('options'),dict)]
+                        if not details or not all(_tc_slot_owned(r,port,direction,family,transport)
+                                                   for r in details):return False
+                    entry=tc_find(iface,port,direction,family,transport,rec,slot_rows,
+                                  strict=rec[direction]>0)
                     targets.append((family,transport,entry))
             if rec[direction]==0:
                 if any(entry for _,_,entry in targets) or tc_action_exists(tc_police_index(port,direction)):
@@ -1216,7 +1240,7 @@ def reconcile(config,monitor=False):
         except Error as e:traffic_error=str(e);failures.append(traffic_error)
     for port,rec in rows.items():
         try:
-            healthy=(not rec.get('pending') and nft_ok(port,rec,nft_items)
+            healthy=(not rec.get('pending') and nft_ok(port,rec,nft_items,validated=True)
                      and (not config.get('tc_enabled') or tc_ok(port,rec,config['iface'],tc_items)))
             if 'auto' in rec:
                 if not healthy:
