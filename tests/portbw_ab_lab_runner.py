@@ -10,8 +10,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -126,8 +124,6 @@ def set_up_link():
             ipv6 = True
         except subprocess.CalledProcessError:
             print("NOTE: IPv6 namespace addresses unavailable; IPv6 filter tests still required")
-        execute("nsenter", "-t", str(child.pid), "-n", "ping", "-c", "1",
-                "-W", "2", "198.18.0.1") if shutil.which("ping") else None
         return child, ipv6
     except Exception:
         child.terminate()
