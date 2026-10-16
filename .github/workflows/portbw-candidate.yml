@@ -35,11 +35,11 @@ jobs:
           if python3 tests/portbw_cpu_probe.py portbw.py --rounds 1 >/tmp/probe.out 2>&1; then
             echo 'DANGER: probe executed in host namespace'; exit 1
           fi
-          grep -q 'REFUSED: host network namespace' /tmp/probe.out
+          grep -q 'REFUSED: lab not explicitly enabled' /tmp/probe.out
           if python3 tests/portbw_ab_lab_runner.py --root /tmp/portbw-cpu-test >/tmp/lab.out 2>&1; then
             echo 'DANGER: lab executed in host namespace'; exit 1
           fi
-          grep -q 'REFUSED: host network namespace' /tmp/lab.out
+          grep -q 'REFUSED: lab not explicitly enabled' /tmp/lab.out
       - name: Assert installer matches candidate code SHA
         shell: bash
         run: |
