@@ -25,6 +25,8 @@ def execute(*args, **kwargs):
 
 
 def isolated():
+    if os.getenv("PORTBW_LAB_ACK") != "isolated-netns-only":
+        raise SystemExit("REFUSED: lab not explicitly enabled")
     if os.geteuid():
         raise SystemExit("REFUSED: must be root in disposable network namespace")
     if os.stat("/proc/self/ns/net").st_ino == os.stat("/proc/1/ns/net").st_ino:
