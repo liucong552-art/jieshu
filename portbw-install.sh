@@ -12,7 +12,8 @@ STATE=/var/lib/portbw-resident-release
 CURRENT="$STATE/current.env"
 SOURCE="$HERE/portbw.py"
 PREVIOUS_SHA='69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359'
-EXPECTED_SHA='601423e191fd809cda1bd7cbbab285096178b938a131ce4d9fe99fb83b08495f'
+PREVIOUS_CANDIDATE_SHA='601423e191fd809cda1bd7cbbab285096178b938a131ce4d9fe99fb83b08495f'
+EXPECTED_SHA='52eaa233f831236973dff6b43d8f320659b29226939ee5ba132d2b9cf31eebfb'
 V1_SHA='29676cc3e07c772cd617ed5e2888a80417144576fd279bc654297e5dcdcaa568'
 V2_SHA='96f3d4c5d0f24cec94a8555c0daec98b6b3ac8414457434ef9735eab540f3b23'
 UNITS=(portbw-restore.service portbw-watch.service portbw-watch.timer)
@@ -80,7 +81,7 @@ read_managed(){
   [[ -f "$CURRENT" && ! -L "$CURRENT" ]] || fail "不存在通用安装器管理记录 $CURRENT；拒绝改写别的版本"
   local old
   old="$(sed -n 's/^source_sha=//p' "$CURRENT")"
-  [[ "$old" == "$V1_SHA" || "$old" == "$V2_SHA" || "$old" == "$PREVIOUS_SHA" || "$old" == "$EXPECTED_SHA" ]] || fail '当前安装记录不是已知 v1/v2/前一版/本候选版；拒绝覆盖'
+  [[ "$old" == "$V1_SHA" || "$old" == "$V2_SHA" || "$old" == "$PREVIOUS_SHA" || "$old" == "$PREVIOUS_CANDIDATE_SHA" || "$old" == "$EXPECTED_SHA" ]] || fail '当前安装记录不是已知 v1/v2/前一版/本候选版；拒绝覆盖'
   [[ -f "$PROG" && ! -L "$PROG" && "$(sha "$PROG")" == "$old" ]] || fail '当前已安装源码与管理记录不匹配；拒绝升级或回滚'
   [[ -L "$CLI" && "$(readlink "$CLI")" == "$PROG" ]] || fail '命令入口不是预期的portbw符号链接'
 }
@@ -166,7 +167,7 @@ restore_backup(){
     [[ -f "$b/0.old" && ! -L "$b/0.old" && -f "$b/6.old" ]] || { say '备份缺少有效旧程序/管理记录';return 1; }
     local oldsha
     oldsha="$(sed -n 's/^source_sha=//p' "$b/6.old")"
-    [[ "$oldsha" == "$V1_SHA" || "$oldsha" == "$V2_SHA" || "$oldsha" == "$PREVIOUS_SHA" || "$oldsha" == "$EXPECTED_SHA" ]] || { say '备份版本标记不是已知发行版';return 1; }
+    [[ "$oldsha" == "$V1_SHA" || "$oldsha" == "$V2_SHA" || "$oldsha" == "$PREVIOUS_SHA" || "$oldsha" == "$PREVIOUS_CANDIDATE_SHA" || "$oldsha" == "$EXPECTED_SHA" ]] || { say '备份版本标记不是已知发行版';return 1; }
     [[ "$(sha "$b/0.old")" == "$oldsha" ]] || { say '备份程序 SHA 校验失败；拒绝回滚';return 1; }
     [[ -L "$b/1.old" && "$(readlink "$b/1.old")" == "$PROG" ]] || { say '旧 CLI 不是预期符号链接；拒绝回滚';return 1; }
   fi
