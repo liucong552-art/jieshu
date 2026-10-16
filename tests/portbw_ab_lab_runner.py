@@ -31,10 +31,16 @@ def isolated():
         raise SystemExit("REFUSED: must be root in disposable network namespace")
     if os.stat("/proc/self/ns/net").st_ino == os.stat("/proc/1/ns/net").st_ino:
         raise SystemExit("REFUSED: host network namespace")
-    if any(Path(f"/sys/class/net/{x}").exists() for x in ("eth0", "wg-nat")):
-        raise SystemExit("REFUSED: a production network device is visible")
-    if Path(f"/sys/class/net/{IFACE}").exists():
-        raise SystemExit("REFUSED: lab device already exists")
+    # /sys/class/net may still display the HOST network namespace when
+    # unshare --net inherits the host's sysfs mount. Netlink queries through
+    # ip -j link are scoped to the ACTUAL running network namespace.
+    links = json.loads(execute("ip", "-j", "link", "show",
+                               stdout=subprocess.PIPE).stdout)
+    names = {link.get("ifname") for link in links}
+    if "eth0" in names or "wg-nat" in names:
+        raise SystemExit("REFUSED: production interfaces visible via netlink")
+    if IFACE in names or PEER in names:
+        raise SystemExit("REFUSED: lab interfaces already exist in namespace")
 
 
 def module(path):
