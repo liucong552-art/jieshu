@@ -311,14 +311,44 @@ def _rule_exact(rule,port,d,kind):
         return d=='up' and _named_ref(expr[2],'limit')==limitname(d,port) and expr[3]=={'drop':None}
     return _named_ref(expr[2],'counter')==countname(d,port)
 
-def nft_ok(port,rec,items=None,*,validated=False):
+def _nft_watch_index(items):
+    """Index ONE already validated nft snapshot, preserving duplicate entries."""
+    rules={};objects={};limits={};order={};generation={}
+    for pos,row in enumerate(items):
+        r=row.get('rule')
+        if r:
+            c=str(r.get('comment',''))
+            match=OWNED_RULE_RE.fullmatch(c)
+            if match:
+                port=int(match[1]);direction=match[2]
+                rules.setdefault(port,[]).append(r)
+                generation.setdefault((port,direction),[]).append(r['handle'])
+                order[c]=pos  # Same last-occurrence semantics as original comprehension.
+        for kind in ('limit','counter'):
+            obj=row.get(kind)
+            if obj:
+                name=obj.get('name','')
+                port=int(name.rsplit('_',1)[-1])
+                objects.setdefault(port,[]).append((kind,name))
+                if kind=='limit':limits.setdefault(name,[]).append(obj)
+    for handles in generation.values():handles.sort()
+    return {'rules':rules,'objects':objects,'limits':limits,
+            'order':order,'generation':generation}
+
+
+def nft_ok(port,rec,items=None,*,validated=False,index=None):
     try:
         if items is None:items=nft_snapshot()
         if not validated:
             validate_base(items)  # Includes isolation: no foreign rule in our chains.
-        rules,objects=owned(items,port)
+        if index is None:
+            rules,objects=owned(items,port)
+            rows=[x['rule'] for x in items if 'rule' in x and str(x['rule'].get('comment','')).startswith(f'pbw-{port}-')]
+        else:
+            rows=index['rules'].get(port,[])
+            rules=[(r['chain'],r['handle']) for r in rows]
+            objects=index['objects'].get(port,[])
         desired=expected_comments(port,rec)
-        rows=[x['rule'] for x in items if 'rule' in x and str(x['rule'].get('comment','')).startswith(f'pbw-{port}-')]
         if {x['comment'] for x in rows}!=desired or len(rows)!=len(desired):return False
         # Inbound: nft and tc can both police. Outbound: nft OUTPUT drops
         # return EPERM to local UDP sendmsg(), aborting apps such as iperf3.
@@ -330,7 +360,8 @@ def nft_ok(port,rec,items=None,*,validated=False):
         for d in CHAIN:
             if not rec[d]:continue
             if d=='up':
-                lims=[x['limit'] for x in items if 'limit' in x and x['limit'].get('name')==limitname(d,port)]
+                lims=([x['limit'] for x in items if 'limit' in x and x['limit'].get('name')==limitname(d,port)]
+                      if index is None else index['limits'].get(limitname(d,port),[]))
                 if len(lims)!=1:return False
                 lim=lims[0]
                 if _limit_rate(lim)!=rec[d] or lim.get('per','second')!='second' \
@@ -340,7 +371,8 @@ def nft_ok(port,rec,items=None,*,validated=False):
                 selected=[r for r in rows if r['comment']==comment(d,port,kind)]
                 if len(selected)!=1 or not _rule_exact(selected[0],port,d,kind):return False
             # DROP must precede named counter, and no earlier accept/bypass exists.
-            order={r['comment']:i for i,x in enumerate(items) if (r:=x.get('rule'))}
+            order=({r['comment']:i for i,x in enumerate(items) if (r:=x.get('rule'))}
+                   if index is None else index['order'])
             if d=='up' and order[comment(d,port,'drop')]>=order[comment(d,port,'count')]:return False
         return True
     except (Error,ValueError,TypeError,KeyError,StopIteration):return False
@@ -566,10 +598,29 @@ def _tc_filter_body(text,port,direction,family,transport,pref):
     protocol=tc_protocol(family)
     head=re.compile(r'^filter protocol '+re.escape(protocol)+r' pref '+str(pref)+
                     r' flower chain 0 handle (?:0x)?'+format(tc_handle(port),'x')+r'\b',re.M)
+    if isinstance(text,dict):
+        # Only complete filter blocks from this SAME snapshot; match with the
+        # original strict expression, including the exact owned handle.
+        for block in text.get((protocol,pref),()):
+            m=head.search(block)
+            if m:return block[m.end():]
+        return None
     m=head.search(text)
     if not m:return None
     next_filter=re.search(r'^filter protocol ',text[m.end():],re.M)
     return text[m.end():m.end()+next_filter.start() if next_filter else len(text)]
+
+
+def _tc_text_index(text):
+    """Split tc -s filter dump once; keep every candidate, including duplicates."""
+    matches=list(re.finditer(r'^filter protocol ',text,re.M))
+    blocks={}
+    for i,m in enumerate(matches):
+        block=text[m.start():matches[i+1].start() if i+1<len(matches) else len(text)]
+        header=re.match(r'^filter protocol (\S+) pref ([0-9]+) ',block)
+        if header:
+            blocks.setdefault((header[1],int(header[2])),[]).append(block)
+    return blocks
 
 def tc_rate_is_ok(entry,b,iface,direction,port,family,transport,rec,text=None,check_rate=True):
     if not entry:return False
@@ -752,7 +803,8 @@ def tc_snapshot(iface):
     rows={d:tc_filters(iface,d) for d in ('ingress','egress')}
     text={d:run(['tc','-s','filter','show','dev',iface,d]) for d in ('ingress','egress')}
     return {'qdiscs':qdiscs,'rows':rows,'text':text,
-            'pref_groups':{d:_tc_pref_groups(rows[d]) for d in rows}}
+            'pref_groups':{d:_tc_pref_groups(rows[d]) for d in rows},
+            'text_index':{d:_tc_text_index(text[d]) for d in text}}
 
 def tc_ok(port,rec,iface,snap=None):
     try:
@@ -781,7 +833,8 @@ def tc_ok(port,rec,iface,snap=None):
                     return False
                 continue
             if not all(entry for _,_,entry in targets):return False
-            text=snap['text'][tcdir] if snap else run(['tc','-s','filter','show','dev',iface,tcdir])
+            text=(snap.get('text_index',{}).get(tcdir,snap['text'][tcdir])
+                  if snap else run(['tc','-s','filter','show','dev',iface,tcdir]))
             if not all(tc_rate_is_ok(entry,rec[direction],iface,direction,port,family,transport,rec,text)
                        for family,transport,entry in targets):return False
         return True
@@ -1051,7 +1104,7 @@ def traffic_snapshot():
     return {'start':start,'end':end,'blocks':police_blocks(output)}
 
 
-def traffic_sample(port,d,rec,snapshot,nft_items):
+def traffic_sample(port,d,rec,snapshot,nft_items,*,generation=None):
     if snapshot is None:raise Error('tc 统计快照不可用')
     block=snapshot['blocks'].get(tc_police_index(port,d),'')
     sent=re.findall(r'\bSent\s+([0-9]+)\s+bytes\s+([0-9]+)\s+pkt\s+' 
@@ -1068,8 +1121,9 @@ def traffic_sample(port,d,rec,snapshot,nft_items):
     # Quantized installed age defines an interval, not a fabricated exact birth.
     # Intersect it over successive samples to detect action recreation even if
     # the new counter has already overtaken the previous counter.
-    handles=sorted(r['rule']['handle'] for r in nft_items if 'rule' in r
-                   and r['rule'].get('comment','').startswith(f'pbw-{port}-{d}-'))
+    handles=(sorted(r['rule']['handle'] for r in nft_items if 'rule' in r
+                    and r['rule'].get('comment','').startswith(f'pbw-{port}-{d}-'))
+             if generation is None else list(generation.get((port,d),())))
     return {'bytes':count,'drops':drops,'overlimits':overlimits,
             'start':start,'end':end,
             'birth_lo':max(0.0,start-age-1.1),'birth_hi':end-age+0.1,
@@ -1226,6 +1280,7 @@ def reconcile(config,monitor=False):
             volatile_load(port,rec)
     try:
         nft_items=ensure_base()
+        nft_index=_nft_watch_index(nft_items)
         tc_items=tc_snapshot(config['iface']) if config.get('tc_enabled') else None
     except Exception:
         for port,rec in rows.items():
@@ -1240,7 +1295,7 @@ def reconcile(config,monitor=False):
         except Error as e:traffic_error=str(e);failures.append(traffic_error)
     for port,rec in rows.items():
         try:
-            healthy=(not rec.get('pending') and nft_ok(port,rec,nft_items,validated=True)
+            healthy=(not rec.get('pending') and nft_ok(port,rec,nft_items,validated=True,index=nft_index)
                      and (not config.get('tc_enabled') or tc_ok(port,rec,config['iface'],tc_items)))
             if 'auto' in rec:
                 if not healthy:
@@ -1254,7 +1309,7 @@ def reconcile(config,monitor=False):
                     for d in CHAIN:
                         try:
                             if traffic is None:raise Error(traffic_error)
-                            samples[d]=traffic_sample(port,d,rec,traffic,nft_items)
+                            samples[d]=traffic_sample(port,d,rec,traffic,nft_items,generation=nft_index['generation'])
                         except Error as e:
                             samples[d]=None;errors[d]=str(e)
                             if traffic is not None:failures.append(f'{port}/{d}: {e}')
