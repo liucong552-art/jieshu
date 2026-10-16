@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Real nft/tc CPU A/B lab, refuses host network namespace.
+
+Must be launched by the accompanying shell script using unshare --net.
+Only creates veth interfaces and nft/tc rules inside a throwaway netns.
+A = pinned main, B = pinned feature branch. Never invokes systemctl.
+"""
+import argparse
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+
+IFACE = "pbwl0"
+PEER = "pbwl1"
+PORT = 43000
+
+
+def execute(*args, **kwargs):
+    return subprocess.run(args, text=True, check=True, **kwargs)
+
+
+def isolated():
+    if os.geteuid():
+        raise SystemExit("REFUSED: must be root in disposable network namespace")
+    if os.stat("/proc/self/ns/net").st_ino == os.stat("/proc/1/ns/net").st_ino:
+        raise SystemExit("REFUSED: host network namespace")
+    if any(Path(f"/sys/class/net/{x}").exists() for x in ("eth0", "wg-nat")):
+        raise SystemExit("REFUSED: a production network device is visible")
+    if Path(f"/sys/class/net/{IFACE}").exists():
+        raise SystemExit("REFUSED: lab device already exists")
+
+
+def module(path):
+    spec = importlib.util.spec_from_file_location("portbw_lab_original", path)
+    obj = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(obj)
+    return obj
+
+
+def make_rec(mod, port, n, automatic):
+    prefs = {f"{family}_{transport}": 65000 - n * 4 - offset
+             for offset, (family, transport) in enumerate(
+                 ((4, "tcp"), (4, "udp"), (6, "tcp"), (6, "udp")))}
+    rec = {"port": port, "up": 125000, "down": 125000,
+           "updated": int(time.time()), "pending": True,
+           "deleting": False, "tc_prefs": prefs}
+    if automatic:
+        opts = {"version": mod.AUTO_VERSION,
+                "base": {"up": 125000, "down": 125000},
+                "limited": {"up": 62500, "down": 62500},
+                "trigger_bp": 7000, "after": 5, "hold": 20, "cooldown": 0}
+        rec["auto"] = opts
+        mod.reset_auto_boot(rec, mod.boot_id())
+    mod.validate_record(port, rec)
+    return rec
+
+
+def prepare_ports(mod, config, count, automatic):
+    for i in range(count):
+        port = PORT + i
+        path = mod.port_file(port)
+        if path.is_file():
+            continue
+        rec = make_rec(mod, port, i, automatic and i == 0)
+        mod.write_json(path, rec)
+        mod.finish_apply(port, rec, config)
+    return list(range(PORT, PORT + count))
+
+
+def reset_automatic(mod, config, enabled):
+    if not enabled:
+        return
+    rec = mod.read_json(mod.port_file(PORT))
+    mod.reset_auto_boot(rec, mod.boot_id())
+    rec["updated"] = int(time.time())
+    mod.write_json(mod.port_file(PORT), rec)
+    mod.volatile_clear(PORT)
+    mod.finish_apply(PORT, rec, config)
+
+
+def audit_records(mod, config, ports):
+    nft = mod.nft_snapshot()
+    tc = mod.tc_snapshot(config["iface"])
+    errors = []
+    for port in ports:
+        rec = mod.read_json(mod.port_file(port))
+        state, is_nft_ok, is_tc_ok = mod.audit_one(port, rec, config, nft, tc)
+        if state != "OK":
+            errors.append({"port": port, "state": state,
+                           "nft_ok": is_nft_ok, "tc_ok": is_tc_ok})
+    if errors:
+        raise RuntimeError(f"rule audit failed: {errors}")
+    return len(ports)
+
+
+def set_up_link():
+    execute("ip", "link", "set", "lo", "up")
+    # Sleep process enters its OWN disposable network namespace. A veth peer is
+    # moved only into that child, never into the host's netns.
+    child = subprocess.Popen(["unshare", "--net", "--", "sleep", "10000"])
+    try:
+        time.sleep(.15)
+        if child.poll() is not None:
+            raise RuntimeError("child unshare exited: nested network namespaces unavailable")
+        execute("ip", "link", "add", IFACE, "type", "veth", "peer", "name", PEER)
+        execute("ip", "link", "set", PEER, "netns", str(child.pid))
+        execute("ip", "addr", "add", "198.18.0.1/30", "dev", IFACE)
+        execute("ip", "link", "set", IFACE, "up")
+        execute("nsenter", "-t", str(child.pid), "-n", "ip", "link", "set", "lo", "up")
+        execute("nsenter", "-t", str(child.pid), "-n", "ip", "addr", "add",
+                "198.18.0.2/30", "dev", PEER)
+        execute("nsenter", "-t", str(child.pid), "-n", "ip", "link", "set", PEER, "up")
+        # IPv6 availability is reported, not silently substituted for IPv4.
+        ipv6 = False
+        try:
+            execute("ip", "-6", "addr", "add", "2001:db8:4300::1/64", "dev", IFACE)
+            execute("nsenter", "-t", str(child.pid), "-n", "ip", "-6", "addr",
+                    "add", "2001:db8:4300::2/64", "dev", PEER)
+            ipv6 = True
+        except subprocess.CalledProcessError:
+            print("NOTE: IPv6 namespace addresses unavailable; IPv6 filter tests still required")
+        execute("nsenter", "-t", str(child.pid), "-n", "ping", "-c", "1",
+                "-W", "2", "198.18.0.1") if shutil.which("ping") else None
+        return child, ipv6
+    except Exception:
+        child.terminate()
+        try:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+        raise
+
+
+def run_trial(name, source, root, seconds, index, mode, child_pid, traffic):
+    trial_name = f"{index:02d}_{name}_{mode}"
+    output = root / "results"
+    output.mkdir(parents=True, exist_ok=True)
+    probe = root / "tools" / "portbw_cpu_probe.py"
+    traffic_file = root / "tools" / "portbw_lab_traffic.py"
+    background = []
+    handles = []
+    try:
+        if traffic == "udp":
+            duration = seconds + 8
+            server_log = (output / f"{trial_name}_server.json").open("w")
+            handles.append(server_log)
+            server = subprocess.Popen([sys.executable, str(traffic_file), "server",
+                                       "--port", str(PORT), "--seconds", str(duration)],
+                                      stdout=server_log, stderr=subprocess.STDOUT)
+            background.append(server)
+            time.sleep(.2)
+            client_log = (output / f"{trial_name}_client.json").open("w")
+            handles.append(client_log)
+            client = subprocess.Popen(["nsenter", "-t", str(child_pid), "-n",
+                                       sys.executable, str(traffic_file), "client",
+                                       "--port", str(PORT), "--seconds",
+                                       str(seconds + 5), "--mbit", "3"],
+                                      stdout=client_log, stderr=subprocess.STDOUT)
+            background.append(client)
+        result = execute(sys.executable, str(probe), str(source), "--rounds",
+                         str(seconds), "--warmup", "3", "--interval", "1",
+                         "--label", trial_name, "--profile",
+                         str(output / f"{trial_name}_profile.pstats"),
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        data = json.loads(result.stdout)
+        (output / f"{trial_name}.json").write_text(result.stdout, encoding="utf-8")
+        print(json.dumps({"trial": trial_name, "rounds": data["completed_rounds"],
+                          "one_core_cpu_process_children_pct": data["process_plus_children_one_core_pct"],
+                          "process_pct": data["process_one_core_pct"],
+                          "system_pct": data["machine_busy_pct"],
+                          "commands": data["child_commands"],
+                          "round_ms": data["round_wall_ms"]}, ensure_ascii=False),
+              flush=True)
+        return data
+    finally:
+        for proc in background:
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        for h in handles:
+            h.close()
+
+
+def main():
+    arg = argparse.ArgumentParser()
+    arg.add_argument("--root", required=True)
+    arg.add_argument("--seconds", type=int, default=30)
+    arg.add_argument("--sizes", default="1,10,25")
+    arg.add_argument("--traffic", choices=["idle", "udp"], default="idle")
+    arg.add_argument("--auto", action="store_true")
+    args = arg.parse_args()
+    isolated()
+    root = Path(args.root).resolve()
+    if not root.name.startswith("portbw-cpu-") or root.parent != Path("/tmp"):
+        arg.error("root must be a direct /tmp/portbw-cpu-* directory")
+    if not (10 <= args.seconds <= 3600):
+        arg.error("seconds must be 10..3600")
+    sizes = [int(n) for n in args.sizes.split(",")]
+    if not sizes or sizes != sorted(set(sizes)) or sizes[0] < 1 or sizes[-1] > 25:
+        arg.error("sizes must be increasing unique integers within 1..25")
+    srcA, srcB = root / "A/portbw.py", root / "B/portbw.py"
+    if not srcA.is_file() or not srcB.is_file():
+        arg.error("both A and B sources are required")
+    import hashlib
+    origsha = hashlib.sha256(srcA.read_bytes()).hexdigest()
+    newsha = hashlib.sha256(srcB.read_bytes()).hexdigest()
+    if origsha != "69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359":
+        raise SystemExit("REFUSED: A must be the immutable original main source")
+    if origsha == newsha:
+        raise SystemExit("REFUSED: candidate source identical to original")
+    child = None
+    try:
+        child, has_ipv6 = set_up_link()
+        env_base = str(root)
+        os.environ.update(PORTBW_STATE=env_base+"/state", PORTBW_CONF=env_base+"/config",
+                          PORTBW_LOCK=env_base+"/locks/manager.lock",
+                          PORTBW_RUN=env_base+"/run", PORTBW_UNITS=env_base+"/units")
+        mod = module(srcA)
+        config = {"iface": IFACE, "tc_enabled": True, "version": 2}
+        mod.write_json(mod.CONF / "config.json", config)
+        mod.tc_prepare(IFACE)
+        trials = []
+        for count in sizes:
+            ports = prepare_ports(mod, config, count, args.auto)
+            print(f"STAGE policy_count={count}, type={'auto+static' if args.auto else 'static'}",
+                  flush=True)
+            for index, name in enumerate(("A", "B"), 1):
+                reset_automatic(mod, config, args.auto)
+                audit_records(mod, config, ports)
+                src = srcA if name == "A" else srcB
+                data = run_trial(name, src, root, args.seconds,
+                                 count, args.traffic, child.pid, args.traffic)
+                audit_records(mod, config, ports)
+                trials.append({"policy_count": count, "version": name,
+                               "cpu_total": data["process_plus_children_one_core_pct"],
+                               "cmds": data["child_commands"],
+                               "mean_ms": data["round_wall_ms"]["mean"]})
+        result = {"success": True, "a_sha256": origsha, "b_sha256": newsha,
+                  "ipv6_test_network_available": has_ipv6,
+                  "duration_each_seconds": args.seconds, "sizes": sizes,
+                  "traffic": args.traffic, "automatic_policy": args.auto, "trials": trials}
+        path = root / "results/summary.json"
+        path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("LAB SUCCESS: results at "+str(path), flush=True)
+    finally:
+        if child:
+            child.terminate()
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill()
+
+
+if __name__ == "__main__":
+    main()
