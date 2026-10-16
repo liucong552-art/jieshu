@@ -1,0 +1,34 @@
+name: V4 candidate checks
+on:
+  pull_request:
+    paths:
+      - 'vless.sh'
+      - 'tests/**'
+      - '.github/workflows/v4-candidate.yml'
+  push:
+    branches:
+      - 'feature/v4-batch-candidate-20261016'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-and-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Bash source syntax
+        run: bash -n vless.sh
+      - name: Compile all Python tests
+        run: python3 -m compileall -q tests
+      - name: Run repository unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Guard against accidental production rollout
+        shell: bash
+        run: |
+          test -f vless.sh
+          grep -q '^# BEGIN CPU_V4_BATCH_TEST$' vless.sh
+          grep -q '^# END CPU_V4_BATCH_TEST$' vless.sh
+          grep -q 'VR_WG_HS_DIAG' vless.sh
