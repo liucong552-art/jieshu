@@ -223,6 +223,8 @@ def main():
     arg.add_argument("--sizes", default="1,10,25")
     arg.add_argument("--traffic", choices=["idle", "udp"], default="idle")
     arg.add_argument("--auto", action="store_true")
+    arg.add_argument("--baseline-only", action="store_true", help="Measure untouched main only; do not run candidate")
+    arg.add_argument("--profile-baseline", action="store_true", help="Extra A-only profiler pass; not used for CPU comparison")
     args = arg.parse_args()
     isolated()
     root = Path(args.root).resolve()
@@ -234,14 +236,14 @@ def main():
     if not sizes or sizes != sorted(set(sizes)) or sizes[0] < 1 or sizes[-1] > 25:
         arg.error("sizes must be increasing unique integers within 1..25")
     srcA, srcB = root / "A/portbw.py", root / "B/portbw.py"
-    if not srcA.is_file() or not srcB.is_file():
-        arg.error("both A and B sources are required")
+    if not srcA.is_file() or (not args.baseline_only and not srcB.is_file()):
+        arg.error("missing required A/B source")
     import hashlib
     origsha = hashlib.sha256(srcA.read_bytes()).hexdigest()
-    newsha = hashlib.sha256(srcB.read_bytes()).hexdigest()
+    newsha = hashlib.sha256(srcB.read_bytes()).hexdigest() if srcB.is_file() else None
     if origsha != "69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359":
         raise SystemExit("REFUSED: A must be the immutable original main source")
-    if origsha == newsha:
+    if not args.baseline_only and origsha == newsha:
         raise SystemExit("REFUSED: candidate source identical to original")
     child = None
     try:
@@ -259,7 +261,8 @@ def main():
             ports = prepare_ports(mod, config, count, args.auto)
             print(f"STAGE policy_count={count}, type={'auto+static' if args.auto else 'static'}",
                   flush=True)
-            for index, name in enumerate(("A", "B"), 1):
+            order = ("A",) if args.baseline_only else ("A", "B")
+            for index, name in enumerate(order, 1):
                 reset_automatic(mod, config, args.auto)
                 audit_records(mod, config, ports)
                 src = srcA if name == "A" else srcB
@@ -270,10 +273,18 @@ def main():
                                "cpu_total": data["process_plus_children_one_core_pct"],
                                "cmds": data["child_commands"],
                                "mean_ms": data["round_wall_ms"]["mean"]})
+                if name == "A" and args.profile_baseline:
+                    profile = root / "results" / f"{count:02d}_A_hotspots.pstats"
+                    execute(sys.executable, str(root / "tools/portbw_cpu_probe.py"),
+                            str(srcA), "--rounds", str(max(10, min(30, args.seconds))),
+                            "--warmup", "2", "--interval", "1", "--profile", str(profile),
+                            "--label", f"{count:02d}_A_profile", stdout=subprocess.PIPE)
+                    print("BASELINE_PYTHON_HOTSPOTS: "+str(profile)+".txt",flush=True)
         result = {"success": True, "a_sha256": origsha, "b_sha256": newsha,
                   "ipv6_test_network_available": has_ipv6,
                   "duration_each_seconds": args.seconds, "sizes": sizes,
-                  "traffic": args.traffic, "automatic_policy": args.auto, "trials": trials}
+                  "traffic": args.traffic, "automatic_policy": args.auto,
+                  "baseline_only": args.baseline_only, "trials": trials}
         path = root / "results/summary.json"
         path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print("LAB SUCCESS: results at "+str(path), flush=True)
