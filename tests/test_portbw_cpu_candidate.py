@@ -157,25 +157,104 @@ class SnapshotTests(unittest.TestCase):
 
 
     def test_tc_text_index_preserves_strict_block_matching(self):
-        parts = []
-        port = 40123
-        handle = format(portbw.tc_handle(port), 'x')
-        for direction in ('up', 'down'):
-            field = 'dst_port' if direction == 'up' else 'src_port'
-            for family, proto in ((4, 'ip'), (6, 'ipv6')):
+        # Actual newline-separated tc-like filters. The previous synthetic
+        # fixture accidentally used literal backslash-n and could pass None==None.
+        port=40123
+        handle=format(portbw.tc_handle(port),'x')
+        blocks=[]
+        for direction in ('up','down'):
+            field='dst_port' if direction=='up' else 'src_port'
+            for family,proto in ((4,'ip'),(6,'ipv6')):
                 for transport in portbw.TRANSPORTS:
-                    pref = 60001 + (family == 6) * 2 + (transport == 'udp')
-                    parts.append(f'filter protocol {proto} pref {pref} flower chain 0 handle 0x{handle}\\n'
-                                 f'  eth_type ipv{family}\\n  ip_proto {transport}\\n  {field} {port}\\n')
-        text = ''.join(parts).replace('\\\\n','\\n')
-        indexed = portbw._tc_text_index(text)
-        for family in portbw.FAMILIES:
-            for transport in portbw.TRANSPORTS:
-                pref = 60001 + (family == 6) * 2 + (transport == 'udp')
-                for direction in ('up', 'down'):
-                    self.assertEqual(
-                        portbw._tc_filter_body(text,port,direction,family,transport,pref),
-                        portbw._tc_filter_body(indexed,port,direction,family,transport,pref))
+                    pref=60001+(family==6)*2+(transport=='udp')
+                    blocks.append(
+                        f'filter protocol {proto} pref {pref} flower chain 0 handle 0x{handle}\n'
+                        f'eth_type ipv{family}\n'
+                        f'ip_proto {transport}\n'
+                        f'{field} {port}\n'
+                        'skip_hw\n'
+                        f'action order 1: police 0x{portbw.tc_police_index(port,direction):x} '
+                        'rate 1000Kbit burst 64Kb action drop/ok\n')
+        decoy=('filter protocol ip pref 60001 flower chain 0 handle 0xabc\n'
+               'ip_proto udp\n')
+        for variant in (
+            '\n'.join(blocks),
+            decoy + ''.join(blocks),
+            ''.join(reversed(blocks)),
+            ''.join(blocks) + decoy,
+            ''.join(blocks[:2]) + blocks[0] + ''.join(blocks[2:]),
+        ):
+            with self.subTest(variant=len(variant)):
+                indexed=portbw._tc_text_index(variant)
+                matches=0
+                for direction in ('up','down'):
+                    for family in portbw.FAMILIES:
+                        for transport in portbw.TRANSPORTS:
+                            pref=60001+(family==6)*2+(transport=='udp')
+                            old=portbw._tc_filter_body(
+                                variant,port,direction,family,transport,pref)
+                            new=portbw._tc_filter_body(
+                                indexed,port,direction,family,transport,pref)
+                            self.assertEqual(old,new)
+                            self.assertIsNotNone(old)
+                            matches+=1
+                self.assertEqual(matches,8)
+
+    def test_nft_index_matches_strict_port_audit(self):
+        port=40123
+        base=125000
+        proto={'match':{'op':'==','left':{'meta':{'key':'l4proto'}},
+                        'right':{'set':['tcp','udp']}}}
+        def rule(d,kind,handle):
+            field='dport' if d=='up' else 'sport'
+            expr=[copy.deepcopy(proto),
+                  {'match':{'op':'==','left':{'payload':{
+                      'protocol':'th','field':field}},'right':port}}]
+            expr.append({'limit':{'name':portbw.limitname(d,port)}} if kind=='drop'
+                        else {'counter':{'name':portbw.countname(d,port)}})
+            if kind=='drop':expr.append({'drop':None})
+            return {'rule':{'family':'inet','table':portbw.TABLE,
+                            'chain':portbw.CHAIN[d], 'handle':handle,
+                            'comment':portbw.comment(d,port,kind),'expr':expr}}
+        items=[
+            {'metainfo':{}},
+            {'table':{'family':'inet','name':portbw.TABLE}},
+            {'chain':{'family':'inet','table':portbw.TABLE,'name':'inbound',
+                      'type':'filter','hook':'input','policy':'accept','prio':-5}},
+            {'chain':{'family':'inet','table':portbw.TABLE,'name':'outbound',
+                      'type':'filter','hook':'output','policy':'accept','prio':-5}},
+            {'limit':{'name':portbw.limitname('up',port),'rate':base,
+                      'rate_unit':'bytes','burst':portbw.burst_bytes(base),
+                      'burst_unit':'bytes','inv':True,'per':'second'}},
+            {'counter':{'name':portbw.countname('up',port)}},
+            {'counter':{'name':portbw.countname('down',port)}},
+            rule('up','drop',11),
+            rule('up','count',12),
+            rule('down','count',13),
+        ]
+        rec={'up':base,'down':base}
+        variants=[('healthy',items,True)]
+        bad=copy.deepcopy(items);bad.pop();variants.append(('missing_count',bad,False))
+        bad=copy.deepcopy(items);bad.insert(-1,copy.deepcopy(items[-2]))
+        variants.append(('duplicate_drop',bad,False))
+        bad=copy.deepcopy(items);bad[-3],bad[-2]=bad[-2],bad[-3]
+        variants.append(('wrong_order',bad,False))
+        bad=copy.deepcopy(items);bad[4]['limit']['rate']=base+1
+        variants.append(('wrong_rate',bad,False))
+        bad=copy.deepcopy(items);bad.append({'counter':{'name':portbw.countname('up',port)}})
+        variants.append(('duplicate_counter',bad,False))
+        for name,case,expected in variants:
+            with self.subTest(name=name):
+                portbw.validate_base(case)
+                index=portbw._nft_watch_index(case)
+                self.assertEqual(portbw.nft_ok(port,rec,case),
+                                 portbw.nft_ok(port,rec,case,validated=True,index=index))
+                self.assertEqual(portbw.nft_ok(port,rec,case),expected)
+        foreign=copy.deepcopy(items)
+        foreign.append({'rule':{'chain':'inbound','handle':22,'comment':'foreign',
+                                'expr':[{'accept':None}]}})
+        with self.assertRaises(portbw.Error):
+            portbw.validate_base(foreign)
 
     def test_nft_index_preserves_port_rules_and_generations(self):
         port = 40123
