@@ -15,6 +15,15 @@
 **按需求查看：** 只用 VLESS：第一～四节；使用另一个 NAT 出口：第五节；更新与排查：第六～七节；独立 SOCKS5：第八节；生产安全提醒：第九节。
 
 > `nat.sh` 仅在 NAT 出口机运行。`vpswg.sh` 和 `natjichang.sh` 仅在 VLESS VPS 运行。不要在客户共用的 NAT 机器上直接试运行 `init/add/del`：它们会重启 WG 接口。
+## 当前正式版：V4（2026-10-16）
+
+- **正式版发布提交**：[`5509924ddde3219d1f1660e582c281bc913034ea`](https://github.com/liucong552-art/jieshu/commit/5509924ddde3219d1f1660e582c281bc913034ea)，对应 [PR #2](https://github.com/liucong552-art/jieshu/pull/2)。
+- **V4 Watchdog CPU 优化**：批量复用 nftables 状态查询，减少 25 个临时节点巡检时的重复开销；不会改变已有节点的端口、UUID、配额及到期时间。实际 CPU 节省取决于真实连接数和流量，不能由节点数量推算。
+- **WG-NAT 握手时间修复**：Watchdog 判断握手有效期时使用检查当下的时间，避免将本轮巡检开始之后出现的新握手误判为“未来握手”。
+- **发布范围**：本次 V4 主要更新 `vless.sh`（及测试和 CI）。`nat.sh`、`vpswg.sh`、`natjichang.sh` 等仍为各自已发布的文件，运行 `vless.sh` **不会**自动重新部署这些独立脚本。
+- **主动握手探测**：NAT 出口机的 `nat.sh` 支持为各 Peer 发送定时数据探测包。该功能与 V4 的 Watchdog 握手时间修复不同；只更新 VPS 的 V4 不会替旧 Peer 自动创建 NAT 端探测定时器。
+- **生产升级提示**：优先做 VPS 快照和节点状态备份；在维护窗口升级，并确认回滚方法。安装 V4 管理模块可能刷新 nftables 规则与 systemd 定时器；无需为安装 V4 而重新创建现有节点或重新运行 WG 的 `init/add`。服务商按一小时平均 CPU 考核时，三分钟测量只能参考，不能代替完整一小时统计。
+
 ## 使用前准备
 
 - Debian 11+ 或 Ubuntu 20.04+
@@ -496,7 +505,7 @@ bash /root/nat.sh add hy2 hy2.example.com '这里替换成VPS公钥'
 - `hy2.example.com`：VLESS VPS 的公网 IPv4 域名，也可以直接填写公网 IPv4。
 - `'这里替换成VPS公钥'`：在 VLESS VPS 执行 `cat /etc/wireguard/wg-nat.pub` 得到的公钥。
 
-NAT 机会自动分配 WG 地址，并打印一条完整的 VPS 回填命令；新增或更新 Peer 时也会自动启用该 Peer 的握手探测。**共享 NAT 注意：add 会重启整个 WG 接口，其他 VPS 可能短暂断线，请选择维护窗口。**
+NAT 机会自动分配 WG 地址，并打印一条完整的 VPS 回填命令；**使用包含 Peer 探测功能的新版 `nat.sh` 执行 `add` 时**，还会尝试自动为本次新增/更新的 Peer 启用探测定时器（需安装 `ping`，且启动 systemd timer 成功）。如果探测启用失败，Peer 本身仍可能创建成功，请检查警告。**已经存在的旧 Peer 不会因为仅更新脚本文件或 VPS 的 V4 就自动启用探测**，可参考第九节的 `probe-enable`。**共享 NAT 注意：`add` 会重启整个 WG 接口，其他 VPS 可能短暂断线，请选择维护窗口。**
 
 ### 4. 回到 VPS 执行回填命令
 
@@ -584,6 +593,8 @@ cat /etc/wireguard/wg-exit.pub
 
 ## 六、更新脚本
 
+> **更新范围必须区分**：运行 `vless.sh` 仅刷新 VLESS 侧相关管理组件；NAT 出口机的 `/root/nat.sh`、VPS 侧 `vpswg.sh` 与 `natjichang.sh` 需要分别管理。GitHub 上的 `main` 更新不会自动修改 VPS 硬盘里的旧脚本。生产环境建议固定已验收的提交 URL，而不是每次自动跟随 `main`。
+
 ### VLESS 管理工具
 
 ```bash
@@ -615,6 +626,15 @@ curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/natjich
 
 ### NAT 出口机
 
+**只核对是否已是最新版（只读、不重启 WG）：**
+
+```bash
+sha256sum /root/nat.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' | sha256sum
+```
+
+两行 SHA256 一样就无需重复下载或初始化。不同则先确认当前脚本的来源和改动；**仅更新管理脚本文件，不等于执行 `init`，也不会自动为旧 Peer 启用探测**。如果目的是给既有 Peer 补上探测，请使用第九节的 `probe-status`/`probe-enable`，不要为此运行会影响所有 WG Peer 的 `init` 或 `add`。
+
 **旧 NAT 机升级前先备份：** 在 NAT 出口机执行以下命令（备份包含 WG 私钥，切勿公开上传），然后安排维护窗口：
 
 ```bash
@@ -625,7 +645,7 @@ tar -C /etc -czf "/root/wg-backups/wireguard-${BACKUP_TS}.tar.gz" wireguard
 iptables-save > "/root/wg-backups/iptables-${BACKUP_TS}.rules"
 ```
 
-以下命令更新脚本并重新初始化 WG，会使连接短暂中断：
+**只有明确需要重新初始化或迁移 NAT 端 WG 配置时**，才在维护窗口执行以下命令；它会更新管理脚本并重新初始化 WG，可能造成共用出口所有 Peer 短暂中断：
 ```bash
 curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
 ```
@@ -791,11 +811,13 @@ SOCKS5 与 VLESS 使用**同一套独立 `portbw` 限速方法**，无需重复�
 
 **注意：** 如果路由器把公网端口 `51004` 映射到家宽主机的 `41004`，限速应设置在本机端口 **`41004`**，不是公网端口 `51004`。SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按本机端口管理 TCP+UDP。SOCKS5 账号创建、到期、删除均不会自动增删 `portbw` 规则；升级 `portbw` 也不会修改 SOCKS5 账号、配额和服务。已安装旧版 `portbw` 的主机先参考前文“旧版升级注意”迁移规则。
 
-## 九、V3.2 运行规则及生产升级注意事项
+## 九、V4 正式版运行规则及生产升级注意事项
 
 - **临时节点看门狗：** 连续第三次恢复失败后启动持久化的 72 小时宽限；宽限期内恢复健康，原 UUID、端口、到期时间不变，并取消倒计时。
 - **宽限届满：** 最终重试依旧失败就按规则删除临时节点，即使当时 NAT 出口整体不可达也不豁免。自然到期节点按正常到期规则清理。
-- **NAT 握手探测：** 新增/更新 Peer 自动开启单 Peer 定时探测，删除 Peer 自动关闭。以前就存在的旧 Peer，不会因你只更新 GitHub 文件而自动开启。
+- **V4 CPU 批量优化与 WG 握手时间修复：** 已包含在正式版 `vless.sh`。它们不会替 NAT 出口机执行 `probe-enable`，也不保证把所有断线都归因于 Watchdog；发现问题请先比对 WG 握手、路由、Xray 服务和 Watchdog 日志。
+- **NAT 主动探测：** 新版 `nat.sh` 在新增/更新 Peer 成功后会*尝试*启用该 Peer 的 systemd 定时器，正常情况下约每 10 秒发送一次普通 WG 内网探测包（不是每 10 秒强制产生一次加密握手）。依赖 `ping`，且 timer 启动必须成功；安装文件、成功创建 Peer、实际启用 timer 是三个不同状态。删除 Peer 会尝试停用对应探测。以前就存在的旧 Peer，不会因只更新 GitHub 或执行 VPS 端 `vless.sh` 而自动开启。
+- **Peer 身份与地址：** `hy2`、`helan` 等是 NAT 管理员自行取的名称，**不能**单凭名字判断是哪台 VPS。启用探测前应核对 `/etc/wireguard/wg-exit-peers.d/<name>.peer` 的 `PublicKey`/`AllowedIPs`，与目标 VPS 的 `wg show wg-nat` 相匹配；避免把探测发给错误的 Peer。
 - **生产 NAT：** `nat.sh init/add/del` 均可能重启整条 WG 接口，影响其他 VPS；必须备份、安排维护窗口并确认回滚方法，不可当作无中断热更新。
 
 ### 单独查看或控制某台 VPS 的探测（可选）
@@ -809,7 +831,18 @@ bash /root/nat.sh probe-enable hy2      # 手动为旧 Peer 开启探测
 bash /root/nat.sh probe-disable hy2     # 手动停止指定 Peer 探测
 ```
 
-探测命令本身不会重启 WG，也不会主动修改其他 Peer。新添加 Peer 已自动启用，无需再手动执行 `probe-enable`。
+上述探测命令本身不会重启 `wg-quick` 或修改其他 Peer 的密钥、Endpoint、WG 路由和防火墙；但 `probe-enable` **会**创建/启用对应的 systemd 探测任务。添加 Peer 时仅在自动启用成功的情况下才无需再执行 `probe-enable`。对于历史 Peer，可在确认映射后单独执行，无需重跑 `nat.sh add`。
+
+**确认探测确实在运行（示例名称 `hy2`，NAT 机执行）：**
+
+```bash
+systemctl is-enabled vr-wg-wg-exit-peer-probe@hy2.timer
+systemctl is-active vr-wg-wg-exit-peer-probe@hy2.timer
+journalctl -u vr-wg-wg-exit-peer-probe@hy2.service -n 30 --no-pager
+wg show wg-exit latest-handshakes
+```
+
+`WG_PROBE_SENT` 只代表程序*尝试发送*了数据探测包，不代表对端已收到或真正握手成功；还需要结合实际握手时间和客户端连通性检查。无业务流量时握手时间不一定每 10 秒改变，WireGuard 会按协议需要协商新密钥。
 
 ---
 
