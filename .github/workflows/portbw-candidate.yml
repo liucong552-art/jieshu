@@ -8,7 +8,9 @@ on:
       - 'portbw-install.sh'
       - 'tests/test_portbw_cpu_candidate.py'
       - 'tests/portbw_cpu_probe.py'
-      - 'tests/portbw_ab_lab.sh'
+      - 'tests/portbw_helan_ab.sh'
+      - 'tests/portbw_ab_lab_runner.py'
+      - 'tests/portbw_lab_traffic.py'
       - '.github/workflows/portbw-candidate.yml'
   workflow_dispatch:
 
@@ -25,7 +27,7 @@ jobs:
         run: |
           python3 -m py_compile portbw.py tests/test_portbw_cpu_candidate.py tests/portbw_cpu_probe.py tests/portbw_ab_lab_runner.py tests/portbw_lab_traffic.py
           bash -n portbw-install.sh
-          if [ -f tests/portbw_ab_lab.sh ]; then bash -n tests/portbw_ab_lab.sh; fi
+          bash -n tests/portbw_helan_ab.sh
       - name: Run differential nft and tc regression tests
         run: python3 -m unittest discover -s tests -p 'test_portbw_cpu_candidate.py' -v
       - name: Verify benchmark host-namespace refusal
