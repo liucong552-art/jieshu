@@ -23,7 +23,9 @@ python3 -B -m py_compile "$ROOT/A/portbw.py" "$ROOT/B/portbw.py" "$ROOT"/tools/*
 (cd "$ROOT/B" && python3 -B -m unittest -v test_portbw_cpu_candidate)
 export PORTBW_LAB_ACK=isolated-netns-only
 echo "===== A/B namespace lab ====="
-unshare --net -- python3 -B "$ROOT/tools/portbw_ab_lab_runner.py" --root "$ROOT" --seconds "${TEST_SECONDS:-30}" --sizes "${TEST_SIZES:-1,10}" --traffic "${TEST_TRAFFIC:-idle}" ${TEST_AUTO:+--auto} 2>&1 | tee "$ROOT/results/lab.log"
+EXTRA=()
+if [[ "${TEST_AUTO:-0}" == 1 ]]; then EXTRA+=(--auto); fi
+unshare --net -- python3 -B "$ROOT/tools/portbw_ab_lab_runner.py" --root "$ROOT" --seconds "${TEST_SECONDS:-30}" --sizes "${TEST_SIZES:-1,10}" --traffic "${TEST_TRAFFIC:-idle}" "${EXTRA[@]}" 2>&1 | tee "$ROOT/results/lab.log"
 echo "===== SUMMARY ====="
 cat "$ROOT/results/summary.json"
 echo "RESULTS=$ROOT/results"
