@@ -1280,6 +1280,8 @@ MODULE_TARGETS=(
   /usr/local/lib/vless-reality/render_table.py
   /usr/local/lib/vless-reality/iplimit-lib.sh
   /usr/local/lib/vless-reality/quota-lib.sh
+  /usr/local/lib/vless-reality/quota-query.py
+  /usr/local/lib/vless-reality/watchdog-batch.py
   /usr/local/sbin/iplimit_restore_all.sh
   /usr/local/sbin/pq_add.sh
   /usr/local/sbin/pq_audit.sh
@@ -2045,51 +2047,80 @@ vr_base64_one_line() {
 }
 
 vr_meta_get() {
-  local file="$1" key="$2"
+  local file="$1" key="$2" line
   [[ -f "$file" ]] || return 1
-  awk -F= -v k="$key" '$0 !~ /^[[:space:]]*#/ && $1==k {sub($1"=", ""); print; exit}' "$file"
+  # Literal data only, never source/eval metadata. Reopen for every call.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "${line%%=*}" == "$key" ]]; then
+      printf '%s\n' "${line#*=}"
+      return 0
+    fi
+  done < "$file"
+  return 0
+}
+
+vr_meta_read() {
+  # Caller declares local -A VR_META=(); Bash dynamic scope avoids eval and
+  # nameref (the installer still supports Bash 4.0). First occurrence wins.
+  local file="$1" line key
+  [[ -f "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    key="${line%%=*}"
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+    if [[ -z "${VR_META[$key]+present}" ]]; then VR_META["$key"]="${line#*=}"; fi
+  done < "$file"
 }
 
 vr_meta_upsert() {
-  local file="$1" key="$2" value="$3" tmp
-  install -d -m 700 "$(dirname "$file")"
-  tmp="$(mktemp "${file}.tmp.XXXXXX")"
-  if [[ -f "$file" ]] && grep -q "^${key}=" "$file" 2>/dev/null; then
-    awk -F= -v k="$key" -v v="$value" '
-      BEGIN { done = 0 }
-      $1 == k { print k "=" v; done = 1; next }
-      { print }
-      END { if (!done) print k "=" v }
-    ' "$file" >"$tmp"
-  else
+  local file="$1" key="$2" value="$3" tmp line done=0 write_failed=0
+  local parent="${1%/*}"
+  [[ "$parent" != "$file" ]] || parent=.
+  install -d -m 700 "$parent" || return 1
+  tmp="$(mktemp "${file}.tmp.XXXXXX")" || return 1
+  if ! {
     if [[ -f "$file" ]]; then
-      cat "$file" >"$tmp"
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$key="* ]]; then
+          printf '%s=%s\n' "$key" "$value" || { write_failed=1; break; }
+          done=1
+        else
+          printf '%s\n' "$line" || { write_failed=1; break; }
+        fi
+      done < "$file" || write_failed=1
     fi
-    printf '%s=%s\n' "$key" "$value" >>"$tmp"
+    if (( write_failed == 0 && done == 0 )); then
+      printf '%s=%s\n' "$key" "$value" || write_failed=1
+    fi
+    (( write_failed == 0 ))
+  } >"$tmp"; then
+    rm -f "$tmp"
+    return 1
   fi
+  # mktemp creates mode 0600 before publication; retain atomic rename.
   if ! mv -f "$tmp" "$file"; then
     rm -f "$tmp"
     return 1
   fi
-  chmod 600 "$file" || return 1
 }
 
 vr_write_meta() {
   local file="$1"
   shift
   local tmp
-  install -d -m 700 "$(dirname "$file")"
-  tmp="$(mktemp "${file}.tmp.XXXXXX")"
-  : >"$tmp"
-  local line
-  for line in "$@"; do
-    printf '%s\n' "$line" >>"$tmp"
-  done
+  local parent="${file%/*}"
+  [[ "$parent" != "$file" ]] || parent=.
+  install -d -m 700 "$parent" || return 1
+  tmp="$(mktemp "${file}.tmp.XXXXXX")" || return 1
+  if ! { if (($#)); then printf '%s\n' "$@"; else :; fi; } >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
   if ! mv -f "$tmp" "$file"; then
     rm -f "$tmp"
     return 1
   fi
-  chmod 600 "$file" || return 1
 }
 
 vr_port_is_listening() {
@@ -2767,7 +2798,7 @@ vr_il_family_guard_state_unlocked() {
   rules="$(
     nft -a list chain inet "$VR_IL_TABLE" "$VR_IL_INPUT_CHAIN" 2>/dev/null || true
   )"
-  comment="$(vr_il_comment_family "$port")"
+  comment="vr-il-family-${port}"
   if [[ "$rules" == *"comment \"${comment}\""* ]]; then
     printf 'active\n'
   else
@@ -2938,7 +2969,7 @@ vr_il_state_unlocked() {
   local port="$1"
   local meta ip_version set_name rules comment
 
-  meta="$(vr_iplimit_meta_file "$port")"
+  meta="${VR_IPLIMIT_STATE_DIR}/${port}.env"
   [[ -f "$meta" ]] || { printf 'none\n'; return 0; }
 
   ip_version="$(vr_meta_get "$meta" IP_VERSION 2>/dev/null || true)"
@@ -2948,7 +2979,7 @@ vr_il_state_unlocked() {
     return 0
   fi
 
-  set_name="$(vr_il_set_name "$port" "$ip_version")"
+  set_name="vr_il${ip_version}_${port}"
   if ! nft list set inet "$VR_IL_TABLE" "$set_name" >/dev/null 2>&1; then
     printf 'stale\n'
     return 0
@@ -2960,10 +2991,10 @@ vr_il_state_unlocked() {
   [[ -n "$rules" ]] || { printf 'stale\n'; return 0; }
 
   for comment in \
-    "$(vr_il_comment_refresh "$port")" \
-    "$(vr_il_comment_claim "$port")" \
-    "$(vr_il_comment_drop "$port")" \
-    "$(vr_il_comment_family "$port")"
+    "vr-il-refresh-${port}" \
+    "vr-il-claim-${port}" \
+    "vr-il-drop-${port}" \
+    "vr-il-family-${port}"
   do
     if [[ "$rules" != *"comment \"${comment}\""* ]]; then
       printf 'stale\n'
@@ -3087,7 +3118,14 @@ vr_pq_delete_port_objects() {
 }
 
 vr_pq_append_atomic_deletes() {
-  local batch="$1" port="$2" chain comment handle object kind name
+  local batch="$1" port="$2" chain comment handle object kind name deletes
+  # Fresh per-port manifest, after the pending commit, never a sweep-wide
+  # cached snapshot. An anomaly uses the original independent query path.
+  if [[ "$VR_PQ_TABLE" == vr_pq && "$VR_PQ_INPUT_CHAIN" == pq_input && "$VR_PQ_OUTPUT_CHAIN" == pq_output ]] \
+    && deletes="$(python3 "${VR_BASE_DIR}/quota-query.py" deletes "$port" 2>/dev/null)"; then
+    if [[ -n "$deletes" ]]; then printf '%s\n' "$deletes" >>"$batch" || return 1; fi
+    return 0
+  fi
   while IFS='|' read -r chain comment; do
     while IFS= read -r handle; do
       [[ "$handle" =~ ^[0-9]+$ ]] || continue
@@ -3210,6 +3248,15 @@ vr_pq_live_used_bytes() {
   local port="$1"
   local quota_b in_b out_b counter_b meta remaining
   local quota_ok=0 counter_ok=0
+
+  # Query immediately for this port, then return to the unchanged
+  # saved -> pending -> rebuild -> clear sequence. No prefetch across ports.
+  if [[ "$VR_PQ_TABLE" == vr_pq ]] \
+    && quota_b="$(python3 "${VR_BASE_DIR}/quota-query.py" live "$port" 2>/dev/null)" \
+    && [[ "$quota_b" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    printf '%s\n' "$quota_b"
+    return 0
+  fi
 
   # Read both independent views.  Never turn a read/parse failure into zero:
   # pq-save would otherwise persist the false zero and rebuild a fresh quota,
@@ -3416,14 +3463,20 @@ vr_pq_delete_managed_port() {
 vr_pq_save_one() {
   local meta="$1"
   [[ -f "$meta" ]] || return 0
-  vr_pq_meta_owner_exists "$meta" || return 0
+  # The caller owns quota.lock throughout. Read this port's metadata once,
+  # before reading counters; no node/kernel state survives a call.
+  local -A VR_META=()
+  vr_meta_read "$meta" || return 1
+  if [[ "${VR_META[OWNER_KIND]:-}" == temp && -n "${VR_META[OWNER_TAG]:-}" ]]; then
+    [[ -f "${VR_TEMP_STATE_DIR}/${VR_META[OWNER_TAG]}.env" ]] || return 0
+  fi
 
   local port original saved live new_saved left next_reset_epoch interval_seconds created_epoch last_reset_epoch owner_kind owner_tag duration_seconds expire_epoch rebuild_pending pending_remaining
-  port="$(vr_meta_get "$meta" PORT || true)"
+  port="${VR_META[PORT]:-}"
   [[ "$port" =~ ^[0-9]+$ ]] || return 0
-  rebuild_pending="$(vr_meta_get "$meta" REBUILD_PENDING 2>/dev/null || true)"
+  rebuild_pending="${VR_META[REBUILD_PENDING]:-}"
   if [[ "$rebuild_pending" == "1" ]]; then
-    pending_remaining="$(vr_meta_get "$meta" LIMIT_BYTES 2>/dev/null || true)"
+    pending_remaining="${VR_META[LIMIT_BYTES]:-}"
     [[ "$pending_remaining" =~ ^[0-9]+$ ]] || pending_remaining=0
     (
       trap '' INT TERM HUP
@@ -3432,16 +3485,16 @@ vr_pq_save_one() {
     ) || return 1
     return 0
   fi
-  original="$(vr_meta_get "$meta" ORIGINAL_LIMIT_BYTES || true)"
-  saved="$(vr_meta_get "$meta" SAVED_USED_BYTES || true)"
-  owner_kind="$(vr_meta_get "$meta" OWNER_KIND || true)"
-  owner_tag="$(vr_meta_get "$meta" OWNER_TAG || true)"
-  duration_seconds="$(vr_meta_get "$meta" DURATION_SECONDS || true)"
-  expire_epoch="$(vr_meta_get "$meta" EXPIRE_EPOCH || true)"
-  next_reset_epoch="$(vr_meta_get "$meta" NEXT_RESET_EPOCH || true)"
-  interval_seconds="$(vr_meta_get "$meta" RESET_INTERVAL_SECONDS || true)"
-  created_epoch="$(vr_meta_get "$meta" CREATED_EPOCH || true)"
-  last_reset_epoch="$(vr_meta_get "$meta" LAST_RESET_EPOCH || true)"
+  original="${VR_META[ORIGINAL_LIMIT_BYTES]:-}"
+  saved="${VR_META[SAVED_USED_BYTES]:-}"
+  owner_kind="${VR_META[OWNER_KIND]:-}"
+  owner_tag="${VR_META[OWNER_TAG]:-}"
+  duration_seconds="${VR_META[DURATION_SECONDS]:-}"
+  expire_epoch="${VR_META[EXPIRE_EPOCH]:-}"
+  next_reset_epoch="${VR_META[NEXT_RESET_EPOCH]:-}"
+  interval_seconds="${VR_META[RESET_INTERVAL_SECONDS]:-}"
+  created_epoch="${VR_META[CREATED_EPOCH]:-}"
+  last_reset_epoch="${VR_META[LAST_RESET_EPOCH]:-}"
   original="${original:-0}"
   saved="${saved:-0}"
   [[ "$original" =~ ^[0-9]+$ && "$saved" =~ ^[0-9]+$ ]] || return 1
@@ -3527,6 +3580,353 @@ vr_pq_reset_due_one() {
 }
 __VR_FILE_13__
 chmod 644 '/usr/local/lib/vless-reality/quota-lib.sh'
+
+cat >'/usr/local/lib/vless-reality/quota-query.py' <<'__VR_QUOTA_QUERY_PY__'
+#!/usr/bin/env python3
+"""Read-only fresh quota snapshots. Embedded by vless.sh, not a repo file.
+
+No cross-request kernel cache. --serve amortizes Python startup only. Each
+state request still executes TWO independent nft queries under the caller's
+quota lock; live/deletes always query again at their original transaction edge.
+Debian nftables 1.1.3 src/json.c obj_print_json emits explicit numeric `used`
+and counter `bytes`, including zero. Missing/null/bool fields are NOT zero.
+"""
+import json
+import re
+import signal
+import subprocess
+import sys
+
+MAX_INT = 2**63 - 1
+TABLE = 'vr_pq'
+CHAINS = ('pq_input', 'pq_output')
+
+
+def uint(value):
+    if type(value) is not int or not 0 <= value <= MAX_INT:
+        raise ValueError('missing/invalid integer')
+    return value
+
+
+def snapshot():
+    proc = subprocess.run(['nft', '-j', '-n', '-a', 'list', 'table', 'inet', TABLE],
+                          text=True, capture_output=True, timeout=12)
+    if proc.returncode:
+        raise ValueError('nft read failed')
+    return index(json.loads(proc.stdout))
+
+
+def index(obj):
+    rows = obj.get('nftables')
+    if not isinstance(rows, list):
+        raise ValueError('missing nftables array')
+    counters, quotas, chains = {}, {}, set()
+    rules = {c: [] for c in CHAINS}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError('bad row')
+        for kind, dest in (('counter', counters), ('quota', quotas)):
+            if kind not in row:
+                continue
+            rec = row[kind]
+            if rec.get('family') == 'inet' and rec.get('table') == TABLE:
+                name = rec.get('name')
+                if not isinstance(name, str) or name in dest:
+                    raise ValueError('missing/duplicate object name')
+                dest[name] = rec
+        rec = row.get('chain', {})
+        if rec.get('family') == 'inet' and rec.get('table') == TABLE:
+            chains.add(rec.get('name'))
+        rec = row.get('rule', {})
+        if rec.get('family') == 'inet' and rec.get('table') == TABLE:
+            if rec.get('chain') in rules:
+                rules[rec['chain']].append(rec)
+    if not set(CHAINS).issubset(chains):
+        raise ValueError('missing chain')
+    return counters, quotas, rules
+
+
+def views(port, snap):
+    counters, quotas, _ = snap
+    quota = pair = None
+    try:
+        quota = uint(quotas['vr_pq_q_' + port]['used'])
+    except (KeyError, ValueError):
+        pass
+    try:
+        pair = uint(uint(counters['vr_pq_in_' + port]['bytes']) +
+                    uint(counters['vr_pq_out_' + port]['bytes']))
+    except (KeyError, ValueError):
+        pass
+    return quota, pair
+
+
+def live(port, snap):
+    values = [v for v in views(port, snap) if v is not None]
+    if not values:
+        raise ValueError('neither independent usage view is readable')
+    return max(values)
+
+
+def state(port, original, saved, snap):
+    quota, pair = views(port, snap)
+    # The fast state path remains deliberately stricter than legacy live():
+    # incomplete objects always get a fresh legacy verification.
+    if quota is None or pair is None:
+        raise ValueError('incomplete quota or counter pair')
+    used = min(original, uint(saved + max(quota, pair)))
+    comments = {c: {r.get('comment') for r in rows if isinstance(r.get('comment'), str)}
+                for c, rows in snap[2].items()}
+    for chain, direction in zip(CHAINS, ('in', 'out')):
+        if 'vr-pq-drop-' + direction + '-' + port not in comments[chain]:
+            raise ValueError('missing drop guard')
+        if used < original and 'vr-pq-count-' + direction + '-' + port not in comments[chain]:
+            raise ValueError('missing count guard')
+    return 'exhausted' if used == original else 'active'
+
+
+def checked_state(port, original, saved):
+    first = state(port, original, saved, snapshot())
+    second = state(port, original, saved, snapshot())
+    if first != second:
+        raise ValueError('state changed between independent queries')
+    return first
+
+
+def deletes(port, snap):
+    counters, quotas, rules = snap
+    commands = []
+    for chain, direction in zip(CHAINS, ('in', 'out')):
+        for kind in ('drop', 'count'):
+            comment = 'vr-pq-' + kind + '-' + direction + '-' + port
+            handles = [uint(r['handle']) for r in rules[chain] if r.get('comment') == comment]
+            for handle in sorted(handles, reverse=True):
+                commands.append(f'delete rule inet {TABLE} {chain} handle {handle}')
+    for kind, name, inventory in (
+            ('counter', 'vr_pq_in_' + port, counters),
+            ('counter', 'vr_pq_out_' + port, counters),
+            ('quota', 'vr_pq_q_' + port, quotas)):
+        if name in inventory:
+            commands.append(f'delete {kind} inet {TABLE} {name}')
+    return '\n'.join(commands)
+
+
+def valid_port(port):
+    # Match the installed Bash helpers' decimal spelling; never shell-evaluate.
+    if not re.fullmatch(r'[0-9]{1,5}', port) or not 1 <= int(port) <= 65535:
+        raise ValueError('bad port')
+    return port
+
+
+def serve():
+    def stop(_signum, _frame):
+        # subprocess.run cleans up an active read-only nft child when unwound.
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    print('ready', flush=True)
+    for line in sys.stdin:
+        fields = line.rstrip('\n').split('|')
+        token = fields[0]
+        answer = 'fallback'
+        try:
+            if len(fields) != 4:
+                raise ValueError('bad request')
+            _, port, original, saved = fields
+            valid_port(port)
+            if not all(re.fullmatch(r'(0|[1-9][0-9]*)', v) for v in (original, saved)):
+                raise ValueError('bad metadata')
+            answer = checked_state(port, uint(int(original)), uint(int(saved)))
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, AttributeError):
+            pass
+        print(token + '|' + answer, flush=True)
+
+
+def main():
+    if sys.argv[1:] == ['--serve']:
+        serve()
+        return
+    mode, port = sys.argv[1:]
+    valid_port(port)
+    snap = snapshot()
+    if mode == 'live':
+        print(live(port, snap))
+    elif mode == 'deletes':
+        # Produce the entire manifest only after validation, never partial output.
+        result = deletes(port, snap)
+        if result:
+            print(result)
+    else:
+        raise ValueError('bad mode')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError, AttributeError):
+        sys.exit(1)  # caller must perform its original fresh read path
+__VR_QUOTA_QUERY_PY__
+chmod 644 '/usr/local/lib/vless-reality/quota-query.py'
+
+cat >'/usr/local/lib/vless-reality/watchdog-batch.py' <<'__VR_WD_BATCH_PY__'
+#!/usr/bin/env python3
+"""Watchdog bounded read-only nft snapshot acceleration, test candidate.
+
+Only emits verified HEALTHY quota/IP states. Missing, malformed, mismatched,
+changing or ambiguous states MUST be checked by the existing legacy functions.
+This helper never changes nftables, quota counters, metadata or timers.
+"""
+import importlib.util
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+BASE = pathlib.Path(__file__).resolve().parent
+QUOTA_DIR = pathlib.Path('/var/lib/vless-reality/quota')
+IP_DIR = pathlib.Path('/var/lib/vless-reality/iplimit')
+MAX_INT = 2**63 - 1
+PORT = re.compile(r'[0-9]{1,5}\Z')
+KEY = re.compile(r'[A-Z][A-Z0-9_]*\Z')
+
+
+def fields(path):
+    """Match common.sh's first-field-wins handling, ignoring comments."""
+    result = {}
+    for line in path.read_text(encoding='utf-8').splitlines():
+        if line.lstrip().startswith('#'):
+            continue
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        if KEY.fullmatch(key) and key not in result:
+            result[key] = value
+    return result
+
+
+def valid_port(raw):
+    return PORT.fullmatch(raw) is not None and 1 <= int(raw) <= 65535
+
+
+def read_ip_table():
+    proc = subprocess.run(
+        ['nft', '-j', '-n', '-a', 'list', 'table', 'inet', 'vr_iplimit'],
+        capture_output=True, text=True, timeout=3, check=True,
+    )
+    data = json.loads(proc.stdout)
+    if not isinstance(data, dict) or not isinstance(data.get('nftables'), list):
+        raise ValueError('malformed nft IP table')
+    table = False
+    chain = False
+    sets = set()
+    comments = set()
+    for row in data['nftables']:
+        if not isinstance(row, dict):
+            raise ValueError('malformed nft IP row')
+        for kind in ('table', 'chain', 'set', 'rule'):
+            if kind not in row:
+                continue
+            rec = row[kind]
+            if not isinstance(rec, dict):
+                raise ValueError('malformed nft IP record')
+            if (rec.get('family'), rec.get('table') if kind != 'table' else rec.get('name')) != ('inet', 'vr_iplimit'):
+                continue
+            if kind == 'table':
+                table = True
+            elif kind == 'chain' and rec.get('name') == 'il_input':
+                chain = True
+            elif kind == 'set':
+                name = rec.get('name')
+                if not isinstance(name, str) or name in sets:
+                    raise ValueError('duplicate or invalid IP set')
+                sets.add(name)
+            elif kind == 'rule' and rec.get('chain') == 'il_input':
+                comment = rec.get('comment')
+                if isinstance(comment, str):
+                    comments.add(comment)
+    if not table or not chain:
+        raise ValueError('missing IP table or chain')
+    return sets, comments
+
+
+def read_quota_module():
+    spec = importlib.util.spec_from_file_location('vr_quota_query', BASE / 'quota-query.py')
+    if spec is None or spec.loader is None:
+        raise ValueError('quota module unavailable')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def batch(quota_dir=QUOTA_DIR, ip_dir=IP_DIR, quota_mod=None,
+          ip_table_reader=read_ip_table):
+    """Build snapshot result; any failed table read disables batch entirely."""
+    qmod = quota_mod or read_quota_module()
+    # Like the existing quota state fast path, compare TWO independent fresh
+    # reads. This catches some concurrent nft rebuilds without treating reads
+    # as one atomic snapshot. Individual repairs ALWAYS use legacy/fresh paths.
+    first = qmod.snapshot()
+    second = qmod.snapshot()
+    sets, comments = ip_table_reader()
+    output = []
+    for path in sorted(quota_dir.glob('*.env')):
+        if not path.is_file() or not valid_port(path.stem):
+            continue
+        port = path.stem
+        try:
+            meta = fields(path)
+            original = meta.get('ORIGINAL_LIMIT_BYTES', '')
+            saved = meta.get('SAVED_USED_BYTES', '')
+            pending = meta.get('REBUILD_PENDING', '')
+            if not all(re.fullmatch(r'(0|[1-9][0-9]*)', v)
+                       for v in (original, saved)):
+                continue
+            if pending == '1':
+                continue
+            o, s = int(original), int(saved)
+            if not 0 < o <= MAX_INT or not 0 <= s <= MAX_INT:
+                continue
+            a, b = qmod.state(port, o, s, first), qmod.state(port, o, s, second)
+            if a == b and a in ('active', 'exhausted'):
+                output.append(f'Q|{port}|{original}|{saved}|{pending}|{a}')
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError, OverflowError):
+            # Uncertain state is not cached; original fresh check decides.
+            continue
+    for path in sorted(ip_dir.glob('*.env')):
+        if not path.is_file() or not valid_port(path.stem):
+            continue
+        port = path.stem
+        try:
+            meta = fields(path)
+            version = meta.get('IP_VERSION', '') or '4'
+            if version not in ('4', '6'):
+                continue
+            set_name = 'vr_il' + version + '_' + port
+            if set_name not in sets:
+                continue
+            expected = {'vr-il-' + part + '-' + port
+                        for part in ('refresh', 'claim', 'drop', 'family')}
+            if expected.issubset(comments):
+                output.append(f'I|{port}|{version}|active')
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+            continue
+    return '\n'.join(output) + ('\n' if output else '')
+
+
+def main():
+    if sys.argv[1:] != ['--batch']:
+        raise SystemExit('only --batch is supported')
+    print(batch(), end='')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError,
+            AttributeError, subprocess.SubprocessError, json.JSONDecodeError):
+        raise SystemExit(1)  # original watchdog must fall back to legacy
+__VR_WD_BATCH_PY__
+chmod 644 '/usr/local/lib/vless-reality/watchdog-batch.py'
 
 cat >'/usr/local/sbin/iplimit_restore_all.sh' <<'__VR_FILE_14__'
 #!/usr/bin/env bash
@@ -4668,28 +5068,8 @@ source /usr/local/lib/vless-reality/quota-lib.sh
 # shellcheck disable=SC1091
 source /usr/local/lib/vless-reality/iplimit-lib.sh
 
-# Watchdog-process-local optimization. Preserve a separate open/read per key:
-# no cross-field or cross-round cache. All protection checks remain unchanged.
-# The installed shared common.sh and all its other callers are unaffected.
-vr_meta_get() {
-  local file="$1" key="$2" line
-  [[ -f "$file" ]] || return 1
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$line" =~ ^[[:space:]]*# ]] && continue
-    if [[ "${line%%=*}" == "$key" ]]; then
-      if [[ "$line" == *=* ]]; then
-        printf '%s\n' "${line#*=}"
-      else
-        printf '%s\n' "$line"
-      fi
-      return 0
-    fi
-  done < "$file"
-  return 0
-}
-
 # BEGIN WATCHDOG_QUOTA_V3_FAST
-# Experimental, watchdog-process-local path. Shared libraries are untouched.
+# Fresh per-check queries; only the Python interpreter is sweep-local.
 # The original vr_pq_state stays available for every anomalous/error case.
 __vr_pq_original_def="$(declare -f vr_pq_state)"
 if [[ "$__vr_pq_original_def" != 'vr_pq_state ()'* ]]; then
@@ -4699,124 +5079,62 @@ fi
 eval "${__vr_pq_original_def/vr_pq_state ()/vr_pq_state_legacy ()}"
 unset __vr_pq_original_def
 
+# One parser process per watchdog sweep. No kernel data is retained between
+# requests. Fixed duplicate FDs survive Bash command substitutions; the coproc
+# special descriptors themselves do not. Stop/restart helpers never own these
+# pipes, and the parser closes every inherited writer lock before starting.
+wd_quota_pid=''
+wd_quota_available=0
+wd_quota_close() {
+  { exec 4>&- 5<&-; } 2>/dev/null || true
+  if [[ -n "$wd_quota_pid" ]]; then
+    kill "$wd_quota_pid" 2>/dev/null || true
+    wait "$wd_quota_pid" 2>/dev/null || true
+  fi
+}
+
+wd_quota_start() {
+  [[ -r "${VR_BASE_DIR}/quota-query.py" ]] || return 0
+  coproc VR_WD_QUOTA {
+    exec 7>&- 8>&- 9>&-
+    exec python3 -u "${VR_BASE_DIR}/quota-query.py" --serve
+  }
+  wd_quota_pid="${VR_WD_QUOTA_PID:-}"
+  [[ -n "$wd_quota_pid" && -n "${VR_WD_QUOTA[1]:-}" && -n "${VR_WD_QUOTA[0]:-}" ]] || return 0
+  if ! { exec 4>&"${VR_WD_QUOTA[1]}" 5<&"${VR_WD_QUOTA[0]}"; } 2>/dev/null; then
+    wd_quota_close
+    return 0
+  fi
+  local greeting
+  if IFS= read -r -t 5 -u 5 greeting && [[ "$greeting" == ready ]]; then
+    wd_quota_available=1
+  else
+    wd_quota_close
+  fi
+}
+trap 'wd_quota_close' EXIT
+
 vr_pq_state_fast() {
-  local port="$1" meta original saved pending first second answer
+  local port="$1" meta original saved pending request response token answer
+  (( wd_quota_available == 1 )) || return 1
   [[ "$port" =~ ^[0-9]+$ ]] || return 1
-  meta="$(vr_quota_meta_file "$port")"
-  [[ -f "$meta" ]] || return 1
-  original="$(vr_meta_get "$meta" ORIGINAL_LIMIT_BYTES 2>/dev/null || true)"
-  saved="$(vr_meta_get "$meta" SAVED_USED_BYTES 2>/dev/null || true)"
-  pending="$(vr_meta_get "$meta" REBUILD_PENDING 2>/dev/null || true)"
+  meta="${VR_QUOTA_STATE_DIR}/${port}.env"
+  local -A VR_META=()
+  vr_meta_read "$meta" || return 1
+  original="${VR_META[ORIGINAL_LIMIT_BYTES]:-}"
+  saved="${VR_META[SAVED_USED_BYTES]:-}"
+  pending="${VR_META[REBUILD_PENDING]:-}"
   [[ "$original" =~ ^(0|[1-9][0-9]*)$ && "$saved" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
   [[ "$pending" != 1 ]] || return 1
-
-  # Two independent, current nftables queries per *individual* state call.
-  # No cache across nodes/checks. If they disagree, fall back to original.
-  first="$(nft -j -n -a list table inet "$VR_PQ_TABLE" 2>/dev/null)" || return 1
-  second="$(nft -j -n -a list table inet "$VR_PQ_TABLE" 2>/dev/null)" || return 1
-  answer="$(
-    printf '%s\036%s' "$first" "$second" |
-      python3 -c "
-import json
-import sys
-
-# Args: PORT, ORIGINAL_LIMIT_BYTES, SAVED_USED_BYTES.
-if len(sys.argv) != 4:
-    sys.exit(11)
-port, original_s, saved_s = sys.argv[1:]
-if not port.isascii() or not port.isdigit():
-    sys.exit(11)
-try:
-    original = int(original_s)
-    saved = int(saved_s)
-except ValueError:
-    sys.exit(11)
-# Stay within original Bash signed 64-bit arithmetic semantics.
-if original < 0 or saved < 0 or max(original, saved) > (2**63 - 1):
-    sys.exit(11)
-
-raw = sys.stdin.buffer.read().split(b'\x1e')
-if len(raw) != 2:
-    sys.exit(12)
-
-
-def state(data):
-    obj = json.loads(data)
-    rows = obj.get('nftables')
-    if not isinstance(rows, list):
-        raise ValueError('No nftables list')
-    counters, quotas = {}, {}
-    chains = set()
-    comments = {'pq_input': set(), 'pq_output': set()}
-    for row in rows:
-        if not isinstance(row, dict):
-            raise ValueError('Bad record')
-        if 'counter' in row:
-            rec = row['counter']
-            if rec.get('family') == 'inet' and rec.get('table') == 'vr_pq':
-                name = rec.get('name')
-                if name in counters:
-                    raise ValueError('Duplicate counter')
-                counters[name] = rec.get('bytes')
-        if 'quota' in row:
-            rec = row['quota']
-            if rec.get('family') == 'inet' and rec.get('table') == 'vr_pq':
-                name = rec.get('name')
-                if name in quotas:
-                    raise ValueError('Duplicate quota')
-                quotas[name] = rec.get('used')
-        if 'chain' in row:
-            rec = row['chain']
-            if rec.get('family') == 'inet' and rec.get('table') == 'vr_pq':
-                chains.add(rec.get('name'))
-        if 'rule' in row:
-            rec = row['rule']
-            if rec.get('family') == 'inet' and rec.get('table') == 'vr_pq':
-                chain, comment = rec.get('chain'), rec.get('comment')
-                if chain in comments and isinstance(comment, str):
-                    comments[chain].add(comment)
-
-    if not {'pq_input', 'pq_output'}.issubset(chains):
-        raise ValueError('Missing chain')
-
-    qi = quotas.get('vr_pq_q_' + port)
-    ci = counters.get('vr_pq_in_' + port)
-    co = counters.get('vr_pq_out_' + port)
-    for n in (qi, ci, co):
-        if type(n) is not int or n < 0 or n > (2**63 - 1):
-            raise ValueError('Missing or invalid object')
-    if ci + co > (2**63 - 1):
-        raise ValueError('Counter sum overflows Bash')
-    # Original vr_pq_live_used_bytes uses max(quota used, counter in+out).
-    live = max(qi, ci + co)
-    if saved + live > (2**63 - 1):
-        raise ValueError('Sum overflows Bash')
-    used = min(original, max(saved, 0) + live)
-    left = max(original - used, 0)
-
-    if 'vr-pq-drop-in-' + port not in comments['pq_input']:
-        raise ValueError('Input drop guard absent')
-    if 'vr-pq-drop-out-' + port not in comments['pq_output']:
-        raise ValueError('Output drop guard absent')
-
-    if left == 0:
-        return 'exhausted'
-    if 'vr-pq-count-in-' + port not in comments['pq_input']:
-        raise ValueError('Input count guard absent')
-    if 'vr-pq-count-out-' + port not in comments['pq_output']:
-        raise ValueError('Output count guard absent')
-    return 'active'
-
-try:
-    a, b = state(raw[0]), state(raw[1])
-    if a != b:
-        raise ValueError('State changed between snapshots')
-except (ValueError, TypeError, KeyError, OverflowError, json.JSONDecodeError):
-    sys.exit(10)  # Caller MUST fall back to original legacy state function.
-print(a)
-" "$port" "$original" "$saved"
-  )" || return 1
-  [[ "$answer" == active || "$answer" == exhausted ]] || return 1
+  request="${BASHPID}:${RANDOM}:${port}"
+  if ! printf '%s|%s|%s|%s\n' "$request" "$port" "$original" "$saved" >&4 \
+    || ! IFS= read -r -t 30 -u 5 response; then
+    # Never accept a delayed response for another port/check after a timeout.
+    kill "$wd_quota_pid" 2>/dev/null || true
+    return 1
+  fi
+  IFS='|' read -r token answer <<<"$response"
+  [[ "$token" == "$request" && ( "$answer" == active || "$answer" == exhausted ) ]] || return 1
   printf '%s\n' "$answer"
 }
 
@@ -4843,6 +5161,135 @@ vr_pq_state() {
 }
 # END WATCHDOG_QUOTA_V3_FAST
 
+# BEGIN CPU_V4_BATCH_TEST
+# Additional opt-in acceleration, isolated to this watchdog process.
+# Batch holds both policy read locks only during short snapshots, and caches
+# exclusively verified healthy states. Failed/absent/changed state goes through
+# the candidate's original fresh path. No timer or fail-closed policy changes.
+# Set VR_WD_BATCH_ENABLE=0 to disable without changing the installed files.
+wd_batch_enabled="${VR_WD_BATCH_ENABLE:-1}"
+wd_batch_ready=0
+wd_batch_last=-999
+wd_batch_disabled=0
+declare -A wd_batch_quota=()
+declare -A wd_batch_ip=()
+
+wd_batch_invalidate() {
+  wd_batch_ready=0
+  wd_batch_last=-999
+  wd_batch_quota=()
+  wd_batch_ip=()
+}
+
+wd_batch_refresh() {
+  wd_batch_invalidate
+  wd_batch_last=$SECONDS  # retry failed nonblocking lock no more than once / 3 s
+  [[ "$wd_batch_enabled" == 1 && "$wd_batch_disabled" == 0 ]] || return 0
+  [[ -r "${VR_BASE_DIR}/watchdog-batch.py" ]] || { wd_batch_disabled=1; return 0; }
+  # Non-blocking locks: never hold up existing health checks for acceleration.
+  if ! vr_try_lock_fd 9 "$VR_PQ_LOCK_FILE"; then
+    { exec 9>&-; } 2>/dev/null || true
+    return 0
+  fi
+  if ! vr_try_lock_fd 8 "$VR_IL_LOCK_FILE"; then
+    { exec 8>&-; } 2>/dev/null || true
+    flock -u 9 || true
+    { exec 9>&-; } 2>/dev/null || true
+    return 0
+  fi
+  local manifest='' status=0 kind port a b c d
+  manifest="$(timeout 8 python3 "${VR_BASE_DIR}/watchdog-batch.py" --batch)" || status=$?
+  flock -u 8 || true
+  { exec 8>&-; } 2>/dev/null || true
+  flock -u 9 || true
+  { exec 9>&-; } 2>/dev/null || true
+  if (( status != 0 )); then
+    wd_batch_disabled=1
+    echo "CPU_V4_BATCH_FALLBACK: snapshot failed rc=$status; legacy checks preserved" >&2
+    return 0
+  fi
+  # Only a strictly validated internal format can become a cache entry.
+  while IFS='|' read -r kind port a b c d; do
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || continue
+    case "$kind" in
+      Q)
+        if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ \
+              && ( "$d" == active || "$d" == exhausted ) ]]; then
+          wd_batch_quota["$port"]="$a|$b|$c|$d"
+        fi
+        ;;
+      I)
+        if [[ "$a" == 4 || "$a" == 6 ]] && [[ "$b" == active ]]; then
+          wd_batch_ip["$port"]="$a"
+        fi
+        ;;
+    esac
+  done <<< "$manifest"
+  wd_batch_last=$SECONDS
+  wd_batch_ready=1
+}
+
+wd_batch_maybe_refresh() {
+  # Bounded cache age: even an otherwise healthy long sweep must refresh.
+  # No result is ever retained across watchdog invocations.
+  if [[ "$wd_batch_enabled" == 1 && "$wd_batch_disabled" == 0 ]] \
+     && (( SECONDS - wd_batch_last >= 3 )); then
+    wd_batch_refresh
+  fi
+}
+
+# Legacy definitions are copied, not modified, so failures can use the exact
+# original codepath (including locking, metadata validation and nft checks).
+__wd_original_pq="$(declare -f vr_pq_state)"
+__wd_original_ip="$(declare -f vr_il_state)"
+[[ "$__wd_original_pq" == 'vr_pq_state ()'* \
+   && "$__wd_original_ip" == 'vr_il_state ()'* ]] || exit 78
+eval "${__wd_original_pq/vr_pq_state ()/vr_pq_state_candidate ()}"
+eval "${__wd_original_ip/vr_il_state ()/vr_il_state_candidate ()}"
+unset __wd_original_pq __wd_original_ip
+
+vr_pq_state() {
+  local port="$1" meta original saved pending cached
+  if (( wd_batch_ready == 1 )) && [[ "$port" =~ ^[0-9]+$ ]] \
+    && [[ -n "${wd_batch_quota[$port]:-}" ]]; then
+    cached="${wd_batch_quota[$port]}"
+    meta="${VR_QUOTA_STATE_DIR}/${port}.env"
+    local -A VR_META=()
+    if vr_meta_read "$meta"; then
+      original="${VR_META[ORIGINAL_LIMIT_BYTES]:-}"
+      saved="${VR_META[SAVED_USED_BYTES]:-}"
+      pending="${VR_META[REBUILD_PENDING]:-}"
+      if [[ "$cached" == "$original|$saved|$pending|active" ]]; then
+        printf 'active\n'
+        return 0
+      fi
+      if [[ "$cached" == "$original|$saved|$pending|exhausted" ]]; then
+        printf 'exhausted\n'
+        return 0
+      fi
+    fi
+  fi
+  vr_pq_state_candidate "$@"
+}
+
+vr_il_state() {
+  local port="$1" meta version
+  if (( wd_batch_ready == 1 )) && [[ "$port" =~ ^[0-9]+$ ]] \
+    && [[ -n "${wd_batch_ip[$port]:-}" ]]; then
+    meta="${VR_IPLIMIT_STATE_DIR}/${port}.env"
+    local -A VR_META=()
+    if vr_meta_read "$meta"; then
+      version="${VR_META[IP_VERSION]:-4}"
+      if [[ "${wd_batch_ip[$port]}" == "$version" ]]; then
+        printf 'active\n'
+        return 0
+      fi
+    fi
+  fi
+  vr_il_state_candidate "$@"
+}
+# END CPU_V4_BATCH_TEST
+
 vr_require_root_supported_os
 vr_ensure_runtime_dirs
 
@@ -4860,6 +5307,8 @@ echo "V3_WATCHDOG_TEMP_LOCK_ACQUIRED: waited ${SECONDS}s" >&2
 # Quota/IP locks are scoped to individual read or repair operations.  Do not
 # hold them while stopping or restarting a service: the service startup/stop
 # gates use the same locks and a process-wide hold would deadlock systemd.
+wd_quota_start
+wd_batch_maybe_refresh
 rc=0
 now="$(date +%s)"
 
@@ -4972,16 +5421,31 @@ wd_node_healthy() {
   systemctl is-active --quiet "${tag}.service" || return 1
   vr_port_is_listening "$port" || return 1
   if [[ "$landing" == "nat" ]]; then
-    wg_if="$(vr_meta_get "$meta" WG_IF 2>/dev/null || true)"
-    mark="$(vr_meta_get "$meta" MARK 2>/dev/null || true)"
-    handshake_max="$(vr_meta_get "$meta" HANDSHAKE_MAX 2>/dev/null || true)"
+    local -A VR_META=()
+    vr_meta_read "$meta" || return 1
+    wg_if="${VR_META[WG_IF]:-}"
+    mark="${VR_META[MARK]:-}"
+    handshake_max="${VR_META[HANDSHAKE_MAX]:-}"
     handshake_max="${handshake_max:-180}"
     [[ -n "$wg_if" && "$mark" =~ ^[0-9]+$ && "$handshake_max" =~ ^[0-9]+$ ]] || return 1
     systemctl is-active --quiet "wg-quick@${wg_if}.service" || return 1
     route_result="$(ip route get 1.1.1.1 mark "$mark" 2>/dev/null || true)"
     grep -qE "\bdev ${wg_if}\b" <<<"$route_result" || return 1
-    hs="$(wg show "$wg_if" latest-handshakes 2>/dev/null | awk 'NF>=2{print $2}' | sort -nr | head -n1 || true)"
-    [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 && now >= hs && now - hs <= handshake_max )) || return 1
+    hs=0
+    local wg_result peer stamp ignored
+    wg_result="$(wg show "$wg_if" latest-handshakes 2>/dev/null || true)"
+    while read -r peer stamp ignored; do
+      [[ "$stamp" =~ ^[0-9]+$ && ${#stamp} -le 12 ]] || continue
+      if (( 10#$stamp > hs )); then hs=$((10#$stamp)); fi
+    done <<<"$wg_result"
+    # WG may handshake after the sweep started; use the time of this check.
+    local wg_check_now
+    printf -v wg_check_now '%(%s)T' -1
+    if [[ ! "$hs" =~ ^[0-9]+$ ]] || (( hs <= 0 || wg_check_now < hs || wg_check_now - hs > handshake_max )); then
+      printf 'VR_WG_HS_DIAG: tag=%s if=%s sweep_now=%s check_now=%s hs=%s max_age=%s\n' \
+        "$tag" "$wg_if" "$now" "$wg_check_now" "$hs" "$handshake_max" >&2
+      return 1
+    fi
   fi
   return 0
 }
@@ -4995,10 +5459,12 @@ stop_temp_listener_failclosed() {
 }
 
 for meta in "$VR_QUOTA_STATE_DIR"/*.env; do
+  wd_batch_maybe_refresh
   [[ -f "$meta" ]] || continue
   port="$(vr_meta_get "$meta" PORT 2>/dev/null || true)"
   [[ "$port" =~ ^[0-9]+$ ]] || continue
   if [[ "$(vr_pq_state "$port")" == "stale" ]]; then
+    wd_batch_invalidate
     echo "⚠️  修复 quota:${port}" >&2
     vr_pq_lock
     vr_pq_save_one "$meta" || rc=1
@@ -5007,10 +5473,12 @@ for meta in "$VR_QUOTA_STATE_DIR"/*.env; do
 done
 
 for meta in "$VR_IPLIMIT_STATE_DIR"/*.env; do
+  wd_batch_maybe_refresh
   [[ -f "$meta" ]] || continue
   port="$(vr_meta_get "$meta" PORT 2>/dev/null || true)"
   [[ "$port" =~ ^[0-9]+$ ]] || continue
   if [[ "$(vr_il_state "$port")" == "stale" ]]; then
+    wd_batch_invalidate
     echo "⚠️  修复 iplimit:${port}" >&2
     vr_il_restore_one "$meta" || rc=1
     vr_il_unlock
@@ -5019,14 +5487,20 @@ done
 
 # IP_LIMIT=0 的临时节点没有 iplimit meta，但仍必须有地址族隔离规则。
 for meta in "$VR_TEMP_STATE_DIR"/*.env; do
+  wd_batch_maybe_refresh
   [[ -f "$meta" ]] || continue
-  tag="$(vr_meta_get "$meta" TAG 2>/dev/null || true)"
-  file_tag="$(basename "$meta" .env)"
-  port="$(vr_meta_get "$meta" PORT 2>/dev/null || true)"
-  expire="$(vr_meta_get "$meta" EXPIRE_EPOCH 2>/dev/null || true)"
-  ip_version="$(vr_meta_get "$meta" IP_VERSION 2>/dev/null || true)"
-  ip_limit="$(vr_meta_get "$meta" IP_LIMIT 2>/dev/null || true)"
-  pq_limit="$(vr_meta_get "$meta" PQ_LIMIT_BYTES 2>/dev/null || true)"
+  # temp.lock excludes managed node writers; keep one local metadata read
+  # for this validation edge. Every kernel protection call still reads anew.
+  declare -A VR_META=()
+  vr_meta_read "$meta" || { rc=1; continue; }
+  tag="${VR_META[TAG]:-}"
+  file_tag="${meta##*/}"
+  file_tag="${file_tag%.env}"
+  port="${VR_META[PORT]:-}"
+  expire="${VR_META[EXPIRE_EPOCH]:-}"
+  ip_version="${VR_META[IP_VERSION]:-}"
+  ip_limit="${VR_META[IP_LIMIT]:-}"
+  pq_limit="${VR_META[PQ_LIMIT_BYTES]:-}"
   ip_version="${ip_version:-4}"
   ip_limit="${ip_limit:-0}"
   if ! vr_is_valid_temp_tag "$tag" || [[ "$tag" != "$file_tag" ]]; then
@@ -5052,6 +5526,7 @@ for meta in "$VR_TEMP_STATE_DIR"/*.env; do
   fi
 
   if (( ip_limit == 0 )) && [[ "$(vr_il_family_guard_state "$port")" == "stale" ]]; then
+    wd_batch_invalidate
     echo "⚠️  修复 family:${port}" >&2
     vr_il_apply_family_guard "$port" "$ip_version" || rc=1
     vr_il_unlock
@@ -5079,6 +5554,7 @@ for meta in "$VR_TEMP_STATE_DIR"/*.env; do
     [[ "$(vr_il_family_guard_state "$port")" == "active" ]] || protection_ready=0
   fi
   if (( protection_ready == 0 )); then
+    wd_batch_invalidate
     echo "❌ 临时节点 ${tag} 的 nftables 防护未就绪，停止监听并等待下轮修复" >&2
     if [[ -n "$pq_limit" ]] && (( quota_ready == 1 )); then
       vr_pq_lock
@@ -5100,6 +5576,7 @@ for meta in "$VR_TEMP_STATE_DIR"/*.env; do
     continue
   fi
 
+  wd_batch_invalidate
   echo "⚠️  临时节点 ${tag} 未健康，尝试恢复" >&2
   systemctl reset-failed "${tag}.service" >/dev/null 2>&1 || true
   restarted=0
@@ -5287,9 +5764,10 @@ for generated_script in \
 do
   bash -n "$generated_script" || die "生成脚本语法检查失败：${generated_script}"
 done
-python3 - /usr/local/lib/vless-reality/render_table.py <<'PY_COMPILE'
+python3 - /usr/local/lib/vless-reality/render_table.py /usr/local/lib/vless-reality/quota-query.py /usr/local/lib/vless-reality/watchdog-batch.py <<'PY_COMPILE'
 import pathlib, sys
-compile(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'), sys.argv[1], 'exec')
+for path in sys.argv[1:]:
+    compile(pathlib.Path(path).read_text(encoding='utf-8'), path, 'exec')
 PY_COMPILE
 
 systemctl daemon-reload

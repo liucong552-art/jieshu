@@ -1,0 +1,63 @@
+--- a/suite.py
++++ b/suite.py
+@@ -435,15 +435,57 @@
+     st['persist_saved']=saved;st['persist_limit']=int(a['ORIGINAL_LIMIT_BYTES']);save(st)
+     return f'pre-reboot authenticated VLESS traffic persisted {saved} bytes'
+ 
++def wait_postboot_listener(name='svpersist', timeout_seconds=150):
++    """Wait for both systemd and a real listening socket after restore.service.
++
++    This waits instead of treating normal systemd startup ordering as a failure.
++    It does not start, restart, or modify the node or security rules.
++    """
++    p=port(name)
++    unit=f'vless-temp-{name}.service'
++    deadline=time.monotonic()+timeout_seconds
++    last_state=None
++    while True:
++        rc,state=shell(['systemctl','is-active',unit],timeout=8)
++        active=(rc==0 and state.strip()=='active')
++        if state != last_state:
++            msg(f'CASE 14 readiness: unit={unit}, systemd={state.strip()}')
++            last_state=state
++        if active and tcp_probe(p,'127.0.0.2',timeout=1.5):
++            return p
++        if time.monotonic()>=deadline:
++            evidence=[]
++            for args in (
++                ['systemctl','status',unit,'--no-pager','-l'],
++                ['journalctl','-b','-u',unit,'--no-pager','-n','30'],
++                ['journalctl','-b','-u','vless-managed-restore.service','--no-pager','-n','30'],
++            ):
++                try:
++                    _,out=shell(args,timeout=12)
++                    evidence.append(out[-1500:])
++                except Exception as exc:evidence.append(str(exc))
++            (RUN/'case14-timeout-diagnostics.txt').write_text('\n----\n'.join(evidence))
++            raise CaseFail(f'{unit} not active+listening after {timeout_seconds}s; diagnostics saved')
++        time.sleep(min(3,max(0,deadline-time.monotonic())))
++
++
+ def postboot_persist(st):
+-    p=port('svpersist');m=qmeta(p)
++    p=wait_postboot_listener()
++    m=qmeta(p)
+     used=int(m.get('SAVED_USED_BYTES','0'))
+     if used<st['persist_saved']:raise CaseFail(f'quota regressed after reboot {used}<{st["persist_saved"]}')
+     if used>st['persist_limit']:raise CaseFail('saved quota exceeded original')
+     if int(m.get('LIMIT_BYTES','0'))!=st['persist_limit']-used:raise CaseFail('remaining not matching saved usage')
+-    if not tcp_probe(p,'127.0.0.2',timeout=2.5):raise CaseFail('persist node not listening after reboot')
+     health()
+-    return f'reboot: saved bytes {used} >= before {st["persist_saved"]}; listeners and WG healthy'
++    # A listening TCP port is not by itself proof of authenticated proxy service.
++    http=local_http_server()
++    try:real_proxy('svpersist',http,n=4096)
++    finally:http.shutdown()
++    # Check no quota rollback from the post-reboot authenticated transfer.
++    used_after=int(qmeta(p).get('SAVED_USED_BYTES','0'))
++    if used_after<st['persist_saved']:raise CaseFail('quota regressed after postboot traffic')
++    return (f'reboot: saved {used} >= before {st["persist_saved"]}; '
++            f'node listening, WG healthy, authenticated VLESS transfer OK')
+ 
+ def cpu_sample():
+     line=Path('/proc/stat').read_text().splitlines()[0].split()
