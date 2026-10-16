@@ -168,13 +168,23 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic):
                                        str(seconds + 5), "--mbit", "3"],
                                       stdout=client_log, stderr=subprocess.STDOUT)
             background.append(client)
-        result = execute(sys.executable, str(probe), str(source), "--rounds",
-                         str(seconds), "--warmup", "3", "--interval", "1",
-                         "--label", trial_name, "--profile",
-                         str(output / f"{trial_name}_profile.pstats"),
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        data = json.loads(result.stdout)
-        (output / f"{trial_name}.json").write_text(result.stdout, encoding="utf-8")
+        # Pure CPU comparison: do NOT enable cProfile during A/B, as its
+        # instrumentation changes the cost of Python's per-rule loops.
+        cmd = [sys.executable, str(probe), str(source), "--rounds",
+               str(seconds), "--warmup", "3", "--interval", "1",
+               "--label", trial_name]
+        result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        (output / f"{trial_name}_stdout.log").write_text(result.stdout,encoding="utf-8")
+        (output / f"{trial_name}_stderr.log").write_text(result.stderr,encoding="utf-8")
+        if result.returncode:
+            raise RuntimeError(f"trial {trial_name} failed: {result.stderr[-1200:] or result.stdout[-1200:]}")
+        markers=[line[len("PORTBW_PROBE_RESULT="):] for line in result.stdout.splitlines()
+                 if line.startswith("PORTBW_PROBE_RESULT=")]
+        if len(markers)!=1:raise RuntimeError(f"trial {trial_name}: missing/multiple CPU result markers")
+        data = json.loads(markers[0])
+        (output / f"{trial_name}.json").write_text(
+            json.dumps(data, ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
         print(json.dumps({"trial": trial_name, "rounds": data["completed_rounds"],
                           "one_core_cpu_process_children_pct": data["process_plus_children_one_core_pct"],
                           "process_pct": data["process_one_core_pct"],
