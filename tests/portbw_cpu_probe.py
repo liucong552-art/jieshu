@@ -63,7 +63,7 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--interval", type=float, default=1.0)
     p.add_argument("--label", default="unlabeled")
-    p.add_argument("--profile", default="", help="Optional cProfile output under /tmp")
+    p.add_argument("--profile", default="", help="Optional profiler output; use in SEPARATE diagnostic run")
     args = p.parse_args()
     check_isolation()
     if args.rounds < 1 or not 0 <= args.warmup <= 20 or not 0.5 <= args.interval <= 10:
@@ -91,12 +91,26 @@ def main():
             return old_run(*a, **kw)
         command = a[0] if a else kw.get("args", [])
         name = os.path.basename(str(command[0])) if command else "unknown"
+        parts = [str(v) for v in command[1:]]
+        if name == "nft":
+            detail = "nft list table" if "list" in parts and "table" in parts else "nft other"
+        elif name == "tc":
+            if "qdisc" in parts:
+                detail = "tc qdisc"
+            elif "filter" in parts:
+                detail = "tc filter stats" if "-s" in parts else "tc filter json"
+            elif "actions" in parts:
+                detail = "tc actions"
+            else:
+                detail = "tc other"
+        else:
+            detail = name
         before = time.perf_counter()
         before_cpu = children_cpu()
         try:
             return old_run(*a, **kw)
         finally:
-            all_calls.append({"command": name,
+            all_calls.append({"command": detail,
                               "wall": time.perf_counter() - before,
                               "child_cpu": children_cpu() - before_cpu})
 
@@ -140,6 +154,13 @@ def main():
         subprocess.run = old_run
         if profile:
             profile.dump_stats(args.profile)
+            import io
+            import pstats
+            text = io.StringIO()
+            stats = pstats.Stats(profile, stream=text)
+            stats.strip_dirs().sort_stats("cumtime").print_stats(35)
+            stats.sort_stats("tottime").print_stats(35)
+            Path(args.profile + ".txt").write_text(text.getvalue(), encoding="utf-8")
 
     totals = Counter(x["command"] for x in all_calls)
     per_command_wall = defaultdict(float)
@@ -163,7 +184,8 @@ def main():
         "process_one_core_pct": round(100 * sum(pycpu) / elapsed, 3) if elapsed else None,
         "process_plus_children_one_core_pct": round(100 * (sum(pycpu) + sum(childcpu)) / elapsed, 3) if elapsed else None,
         "machine_busy_pct": round(machine_busy, 3) if machine_busy is not None else None,
-        "machine_one_core_equivalent_pct": round(machine_busy * os.cpu_count(), 3) if machine_busy is not None else None,
+        "cpu_count_for_equivalent": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(),
+        "machine_one_core_equivalent_pct": round(machine_busy * (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()), 3) if machine_busy is not None else None,
         "round_wall_ms": {
             "mean": round(1000 * statistics.mean(laps), 3) if laps else None,
             "max": round(1000 * max(laps), 3) if laps else None,
@@ -174,6 +196,8 @@ def main():
         "command_wall_seconds": {k: round(v, 4) for k, v in per_command_wall.items()},
         "command_child_cpu_seconds": {k: round(v, 4) for k, v in per_command_childcpu.items()},
         "profile_path": args.profile or None,
+        "profile_report_path": args.profile + ".txt" if args.profile else None,
+        "measurement_includes_profiler_overhead": bool(args.profile),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if errors or len(laps) != args.rounds:
