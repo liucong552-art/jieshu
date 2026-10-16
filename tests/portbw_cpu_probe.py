@@ -21,6 +21,8 @@ import time
 
 
 def check_isolation():
+    if os.getenv("PORTBW_LAB_ACK") != "isolated-netns-only":
+        raise SystemExit("REFUSED: lab not explicitly enabled")
     host = os.stat("/proc/1/ns/net").st_ino
     ours = os.stat("/proc/self/ns/net").st_ino
     if ours == host:
