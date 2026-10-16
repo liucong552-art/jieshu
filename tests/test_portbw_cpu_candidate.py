@@ -156,5 +156,43 @@ class SnapshotTests(unittest.TestCase):
                              portbw.tc_ok(40123, zero_rec, 'veth-test', modified))
 
 
+    def test_tc_text_index_preserves_strict_block_matching(self):
+        parts = []
+        port = 40123
+        handle = format(portbw.tc_handle(port), 'x')
+        for direction in ('up', 'down'):
+            field = 'dst_port' if direction == 'up' else 'src_port'
+            for family, proto in ((4, 'ip'), (6, 'ipv6')):
+                for transport in portbw.TRANSPORTS:
+                    pref = 60001 + (family == 6) * 2 + (transport == 'udp')
+                    parts.append(f'filter protocol {proto} pref {pref} flower chain 0 handle 0x{handle}\\n'
+                                 f'  eth_type ipv{family}\\n  ip_proto {transport}\\n  {field} {port}\\n')
+        text = ''.join(parts).replace('\\\\n','\\n')
+        indexed = portbw._tc_text_index(text)
+        for family in portbw.FAMILIES:
+            for transport in portbw.TRANSPORTS:
+                pref = 60001 + (family == 6) * 2 + (transport == 'udp')
+                for direction in ('up', 'down'):
+                    self.assertEqual(
+                        portbw._tc_filter_body(text,port,direction,family,transport,pref),
+                        portbw._tc_filter_body(indexed,port,direction,family,transport,pref))
+
+    def test_nft_index_preserves_port_rules_and_generations(self):
+        port = 40123
+        rules = []
+        for i,(direction,kind) in enumerate((('up','drop'),('up','count'),('down','count'))):
+            rules.append({'rule':{'chain':portbw.CHAIN[direction], 'handle':10+i,
+                                  'comment':portbw.comment(direction,port,kind)}})
+        items = [{'metainfo':{}}, *rules,
+                 {'limit':{'name':portbw.limitname('up',port)}},
+                 {'counter':{'name':portbw.countname('up',port)}},
+                 {'counter':{'name':portbw.countname('down',port)}}]
+        idx = portbw._nft_watch_index(items)
+        self.assertEqual(idx['rules'][port], [r['rule'] for r in rules])
+        self.assertEqual(idx['generation'][(port,'up')],[10,11])
+        self.assertEqual(idx['generation'][(port,'down')],[12])
+        self.assertEqual(set(idx['objects'][port]),set(portbw.owned(items,port)[1]))
+
+
 if __name__ == '__main__':
     unittest.main()
