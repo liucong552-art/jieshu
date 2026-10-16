@@ -4981,7 +4981,14 @@ wd_node_healthy() {
     route_result="$(ip route get 1.1.1.1 mark "$mark" 2>/dev/null || true)"
     grep -qE "\bdev ${wg_if}\b" <<<"$route_result" || return 1
     hs="$(wg show "$wg_if" latest-handshakes 2>/dev/null | awk 'NF>=2{print $2}' | sort -nr | head -n1 || true)"
-    [[ "$hs" =~ ^[0-9]+$ ]] && (( hs > 0 && now >= hs && now - hs <= handshake_max )) || return 1
+    # WG may handshake after the sweep started; use the time of this check.
+    local wg_check_now
+    printf -v wg_check_now '%(%s)T' -1
+    if [[ ! "$hs" =~ ^[0-9]+$ ]] || (( hs <= 0 || wg_check_now < hs || wg_check_now - hs > handshake_max )); then
+      printf 'VR_WG_HS_DIAG: tag=%s if=%s sweep_now=%s check_now=%s hs=%s max_age=%s\n' \
+        "$tag" "$wg_if" "$now" "$wg_check_now" "$hs" "$handshake_max" >&2
+      return 1
+    fi
   fi
   return 0
 }
