@@ -199,7 +199,8 @@ def main():
         "profile_report_path": args.profile + ".txt" if args.profile else None,
         "measurement_includes_profiler_overhead": bool(args.profile),
     }
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    # Single parseable marker even when portbw auto transitions print status.
+    print("PORTBW_PROBE_RESULT="+json.dumps(result,ensure_ascii=False,sort_keys=True))
     if errors or len(laps) != args.rounds:
         raise SystemExit(1)
 
