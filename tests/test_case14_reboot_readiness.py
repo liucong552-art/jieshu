@@ -23,7 +23,7 @@ class RebootProbeTests(unittest.TestCase):
              patch.object(probe.pathlib.Path, 'read_text', return_value='PORT=51888\n'), \
              patch.object(probe, 'command', side_effect=lambda *args: next(states)), \
              patch.object(probe, 'probe', side_effect=lambda *args: next(sockets)), \
-             patch.object(probe.time, 'monotonic', side_effect=[0, 1, 2, 3]), \
+             patch.object(probe.time, 'monotonic', side_effect=range(40)), \
              patch.object(probe.time, 'sleep'):
             self.assertEqual(probe.main(), 0)
 
