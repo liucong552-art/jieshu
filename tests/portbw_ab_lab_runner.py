@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -255,6 +256,17 @@ def main():
         raise SystemExit("REFUSED: A must be the immutable original main source")
     if not args.baseline_only and origsha == newsha:
         raise SystemExit("REFUSED: candidate source identical to original")
+    # Each separate unshare run starts with a fresh kernel ruleset. Prior
+    # phase's durable intent MUST also be reset, or prepare_ports() would
+    # incorrectly skip applying rules in the new namespace. Preserve results.
+    for name in ("state", "config", "run", "locks"):
+        scratch = root / name
+        if scratch.is_symlink():
+            raise SystemExit(f"REFUSED: scratch path is symlink: {scratch}")
+        if scratch.is_dir():
+            shutil.rmtree(scratch)
+        elif scratch.exists():
+            raise SystemExit(f"REFUSED: scratch path is not a directory: {scratch}")
     child = None
     try:
         child, has_ipv6 = set_up_link()
