@@ -189,6 +189,25 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic):
                     proc.kill()
         for h in handles:
             h.close()
+        if traffic == "udp":
+            server_result = output / f"{trial_name}_server.json"
+            client_result = output / f"{trial_name}_client.json"
+            if not server_result.is_file() or not client_result.is_file():
+                raise RuntimeError("missing UDP traffic records")
+            try:
+                server_data = json.loads(server_result.read_text().strip().splitlines()[-1])
+                client_data = json.loads(client_result.read_text().strip().splitlines()[-1])
+            except (ValueError, IndexError) as exc:
+                raise RuntimeError("cannot parse UDP traffic results") from exc
+            # This is a smoke-test upper bound, not an exact throughput claim.
+            # The 1 Mbps UDP upload policer should never forward 3 Mbps.
+            if not (client_data.get("tx_bytes", 0) > 0
+                    and server_data.get("rx_bytes", 0) >= 0):
+                raise RuntimeError("UDP generator did not produce valid traffic data")
+            print(json.dumps({"trial": trial_name, "udp_sent_bytes": client_data["tx_bytes"],
+                              "udp_server_rx_bytes": server_data["rx_bytes"],
+                              "udp_send_errors": client_data["send_errors"]}),
+                  flush=True)
 
 
 def main():
