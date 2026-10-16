@@ -5,7 +5,7 @@ umask 077
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
 BRANCH=opt/portbw-cpu-snapshot-index-20261016
 A_SHA=69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359
-B_SHA=601423e191fd809cda1bd7cbbab285096178b938a131ce4d9fe99fb83b08495f
+B_SHA=52eaa233f831236973dff6b43d8f320659b29226939ee5ba132d2b9cf31eebfb
 [[ $(id -u) == 0 && $(hostname) == helan ]] || { echo "Only root on Helan"; exit 1; }
 for c in curl python3 sha256sum unshare nsenter ip nft tc; do command -v "$c" >/dev/null || exit 1; done
 ROOT=$(mktemp -d /tmp/portbw-cpu-XXXXXXXX)
