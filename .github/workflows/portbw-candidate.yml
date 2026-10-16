@@ -23,11 +23,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check Python syntax and shell syntax
         run: |
-          python3 -m py_compile portbw.py tests/test_portbw_cpu_candidate.py tests/portbw_cpu_probe.py
+          python3 -m py_compile portbw.py tests/test_portbw_cpu_candidate.py tests/portbw_cpu_probe.py tests/portbw_ab_lab_runner.py tests/portbw_lab_traffic.py
           bash -n portbw-install.sh
           if [ -f tests/portbw_ab_lab.sh ]; then bash -n tests/portbw_ab_lab.sh; fi
       - name: Run differential nft and tc regression tests
         run: python3 -m unittest discover -s tests -p 'test_portbw_cpu_candidate.py' -v
+      - name: Verify benchmark host-namespace refusal
+        shell: bash
+        run: |
+          set -e
+          if python3 tests/portbw_cpu_probe.py portbw.py --rounds 1 >/tmp/probe.out 2>&1; then
+            echo 'DANGER: probe executed in host namespace'; exit 1
+          fi
+          grep -q 'REFUSED: host network namespace' /tmp/probe.out
+          if python3 tests/portbw_ab_lab_runner.py --root /tmp/portbw-cpu-test >/tmp/lab.out 2>&1; then
+            echo 'DANGER: lab executed in host namespace'; exit 1
+          fi
+          grep -q 'REFUSED: host network namespace' /tmp/lab.out
       - name: Assert installer matches candidate code SHA
         shell: bash
         run: |
