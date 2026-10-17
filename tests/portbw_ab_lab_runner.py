@@ -143,8 +143,8 @@ def set_up_link():
         raise
 
 
-def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, automatic=False):
-    trial_name = f"{index:02d}_{name}_{mode}"
+def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, automatic=False, proto="udp", family="ipv4"):
+    trial_name = f"{index:02d}_{name}_{mode}_{proto}_{family}"
     output = root / "results"
     output.mkdir(parents=True, exist_ok=True)
     probe = root / "tools" / "portbw_cpu_probe.py"
@@ -156,7 +156,7 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, auto
             duration = seconds + 8
             server_log = (output / f"{trial_name}_server.json").open("w")
             handles.append(server_log)
-            server = subprocess.Popen([sys.executable, str(traffic_file), "server",
+            server = subprocess.Popen([sys.executable, str(traffic_file), "server", "--proto", proto, "--family", family,
                                        "--port", str(PORT), "--seconds", str(duration)],
                                       stdout=server_log, stderr=subprocess.STDOUT)
             background.append(server)
@@ -164,7 +164,7 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, auto
             client_log = (output / f"{trial_name}_client.json").open("w")
             handles.append(client_log)
             client = subprocess.Popen(["nsenter", "-t", str(child_pid), "-n",
-                                       sys.executable, str(traffic_file), "client",
+                                       sys.executable, str(traffic_file), "client", "--proto", proto, "--family", family,
                                        "--port", str(PORT), "--seconds",
                                        str(seconds + 5), "--mbit", "3"],
                                       stdout=client_log, stderr=subprocess.STDOUT)
@@ -252,6 +252,8 @@ def main():
     arg.add_argument("--sizes", default="1,10,25")
     arg.add_argument("--traffic", choices=["idle", "udp"], default="idle")
     arg.add_argument("--auto", action="store_true")
+    arg.add_argument("--proto", choices=["udp","tcp"], default="udp")
+    arg.add_argument("--family", choices=["ipv4","ipv6"], default="ipv4")
     arg.add_argument("--baseline-only", action="store_true", help="Measure untouched main only; do not run candidate")
     arg.add_argument("--profile-baseline", action="store_true", help="Extra A-only profiler pass; not used for CPU comparison")
     args = arg.parse_args()
@@ -288,6 +290,8 @@ def main():
     child = None
     try:
         child, has_ipv6 = set_up_link()
+        if args.traffic == "udp" and args.family == "ipv6" and not has_ipv6:
+            raise RuntimeError("IPv6 requested but not configured")
         env_base = str(root)
         os.environ.update(PORTBW_STATE=env_base+"/state", PORTBW_CONF=env_base+"/config",
                           PORTBW_LOCK=env_base+"/locks/manager.lock",
@@ -308,7 +312,7 @@ def main():
                 src = srcA if name == "A" else srcB
                 data = run_trial(name, src, root, args.seconds,
                                  count, args.traffic, child.pid, args.traffic,
-                                 automatic=args.auto)
+                                 automatic=args.auto, proto=args.proto, family=args.family)
                 audit_records(mod, config, ports)
                 trials.append({"policy_count": count, "version": name,
                                "cpu_total": data["process_plus_children_one_core_pct"],
@@ -324,7 +328,8 @@ def main():
         result = {"success": True, "a_sha256": origsha, "b_sha256": newsha,
                   "ipv6_test_network_available": has_ipv6,
                   "duration_each_seconds": args.seconds, "sizes": sizes,
-                  "traffic": args.traffic, "automatic_policy": args.auto,
+                  "traffic": args.traffic, "transport":args.proto,"family":args.family,
+                  "automatic_policy": args.auto,
                   "baseline_only": args.baseline_only, "trials": trials}
         path = root / "results/summary.json"
         path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
