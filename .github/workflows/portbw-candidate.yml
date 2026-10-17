@@ -25,6 +25,7 @@ on:
       - 'tests/portbw_helan_tcp_goodput.sh'
       - 'tests/portbw_helan_burst_fix.sh'
       - 'tests/portbw_helan_burst_semantic.sh'
+      - 'tests/portbw_helan_live_path_diagnose.py'
       - 'tests/portbw_helan_burst_semantic.sh'
       - '.github/workflows/portbw-candidate.yml'
   workflow_dispatch:
@@ -43,7 +44,7 @@ jobs:
           python3 -m py_compile portbw.py tests/test_portbw_cpu_candidate.py tests/portbw_cpu_probe.py tests/portbw_ab_lab_runner.py tests/portbw_lab_traffic.py tests/portbw_lab_outbound_traffic.py tests/portbw_lab_semantics.py tests/portbw_lab_outbound_traffic.py tests/portbw_lab_semantic_runner.py tests/test_portbw_semantic_acceptance.py tests/verify_portbw_semantic_harness.py
           bash -n portbw-install.sh
           bash -n portbw-onekey.sh
-          python3 -m py_compile tests/portbw_helan_up_diagnose.py tests/portbw_lab_tcp_goodput.py
+          python3 -m py_compile tests/portbw_helan_up_diagnose.py tests/portbw_lab_tcp_goodput.py tests/portbw_helan_live_path_diagnose.py
           bash -n tests/portbw_helan_tcp_goodput.sh
           bash -n tests/portbw_helan_burst_fix.sh
           bash -n tests/portbw_helan_burst_semantic.sh
