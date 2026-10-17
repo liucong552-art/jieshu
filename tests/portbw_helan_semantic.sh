@@ -17,7 +17,7 @@ done
 printf "%s  %s\n" "69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359" "$ROOT/A/portbw.py" "52eaa233f831236973dff6b43d8f320659b29226939ee5ba132d2b9cf31eebfb" "$ROOT/B/portbw.py" | sha256sum -c -
 python3 -m py_compile "$ROOT"/tools/*.py "$ROOT/A/portbw.py" "$ROOT/B/portbw.py"
 export PORTBW_LAB_ACK=isolated-netns-only
-for suite in aggregate faults; do
+for suite in aggregate faults lifecycle; do
   for version in A B; do
     echo "===== SEMANTIC SUITE=$suite VERSION=$version ====="
     unshare --net -- python3 -B "$ROOT/tools/portbw_lab_semantic_runner.py" --root "$ROOT" --version "$version" --suite "$suite" --seconds "${SEMANTIC_SECONDS:-18}" 2>&1 | tee "$ROOT/results/${suite}_${version}.log"
