@@ -5,7 +5,7 @@ umask 077
 [[ $(id -u) == 0 && $(hostname) == helan ]] || { echo "REFUSED: Helan root only"; exit 1; }
 for c in curl python3 sha256sum unshare nsenter ip nft tc; do command -v "$c" >/dev/null || exit 1; done
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
-REF=cb7d8ad7b88e3367af9faedc9587ad07f08e1ec8
+REF=69abb08380846957f774dca2a19c829069a916dc
 ROOT=$(mktemp -d /tmp/portbw-cpu-XXXXXXXX)
 mkdir -p "$ROOT"/{A,B,tools,results}
 echo "SEMANTIC_FIX_ROOT=$ROOT SOURCE_REF=$REF"
@@ -17,6 +17,7 @@ printf "%s  %s\n" f0ebe551e8c0345c045a558b39a8b13523b2be8195255c67db13eec3eff5dc
 python3 -B "$ROOT/tools/verify_portbw_semantic_harness.py" "$ROOT/tools/portbw_lab_semantics.py"
 python3 -m py_compile "$ROOT"/tools/*.py "$ROOT/B/portbw.py"
 export PORTBW_LAB_ACK=isolated-netns-only
+export PORTBW_LAB_B_SHA=f0ebe551e8c0345c045a558b39a8b13523b2be8195255c67db13eec3eff5dc1a
 for suite in aggregate outbound faults lifecycle; do
   echo "==== BURST FIX SUITE=$suite VERSION=B ===="
   unshare --net -- python3 -B "$ROOT/tools/portbw_lab_semantic_runner.py" --root "$ROOT" --version B --suite "$suite" --seconds 18 2>&1 | tee "$ROOT/results/fix_${suite}.log"
