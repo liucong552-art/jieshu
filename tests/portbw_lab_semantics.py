@@ -232,6 +232,73 @@ def aggregate(mod,config,pid,root,label,seconds):
                 f"{label}/{scenario}: could not establish shared-cap behavior "
                 f"after {len(failures)} attempts: {failures}")
 
+
+def outbound(mod,config,pid,root,label,seconds):
+    """Real one-way egress, UDP IPv4 and IPv6 share 'down' police index."""
+    script=Path(__file__).with_name("portbw_lab_outbound_traffic.py")
+    output=root/"results"/"semantics"
+    output.mkdir(parents=True,exist_ok=True)
+    families=("ipv4","ipv6")
+    def sample(tag, source_port, families, mbit):
+        procs=[];files=[]
+        try:
+            for family in families:
+                log=output/f"{label}_{tag}_{family}_sink.log"
+                fp=log.open("w")
+                cmd=["nsenter","-t",str(pid),"-n",sys.executable,str(script),
+                     "sink","--family",family,"--source-port",str(source_port),
+                     "--seconds",str(seconds+3),"--mbit",str(mbit)]
+                pr=subprocess.Popen(cmd,stdout=fp,stderr=subprocess.STDOUT)
+                procs.append((pr,log,"sink"));files.append(fp)
+            time.sleep(.4)
+            for family in families:
+                log=output/f"{label}_{tag}_{family}_source.log"
+                fp=log.open("w")
+                cmd=[sys.executable,str(script),"source","--family",family,
+                     "--source-port",str(source_port),"--seconds",str(seconds),
+                     "--mbit",str(mbit)]
+                pr=subprocess.Popen(cmd,stdout=fp,stderr=subprocess.STDOUT)
+                procs.append((pr,log,"source"));files.append(fp)
+            for pr,log,role in procs:
+                try:pr.wait(timeout=seconds+9)
+                except subprocess.TimeoutExpired:
+                    pr.kill();pr.wait()
+                    raise RuntimeError(f"outbound {role} timed out: {log}")
+                if pr.returncode:
+                    raise RuntimeError(f"outbound {role} failed: {log.read_text()[-1800:]}")
+            sent=received=0
+            for pr,log,role in procs:
+                data=json.loads(log.read_text().strip().splitlines()[-1].split("OUTBOUND_TRAFFIC=",1)[1])
+                if role=="source":sent+=data["bytes"]
+                else:received+=data["bytes"]
+            result={"version":label,"tag":tag,"offered_mbps":round(sent*8/seconds/1e6,3),
+                    "delivered_mbps":round(received*8/seconds/1e6,3)}
+            print("SEMANTIC_OUTBOUND="+json.dumps(result,sort_keys=True),flush=True)
+            return result
+        finally:
+            for pr,_,_ in procs:
+                if pr.poll() is None:
+                    pr.terminate()
+                    try:pr.wait(timeout=2)
+                    except subprocess.TimeoutExpired:pr.kill();pr.wait()
+            for fp in files:fp.close()
+
+    # First demonstrate the same output interface can transmit >= 3 Mbps
+    # when packets do not match the regulated SOURCE port.
+    control=sample("unregulated",43080,families,3)
+    if control["delivered_mbps"]<3:
+        raise RuntimeError(f"unregulated outbound too slow: {control}")
+    before=police_stats(mod,"down")
+    measured=sample("regulated",PORT,families,3)
+    pressure=police_delta(before,police_stats(mod,"down"))
+    if not (measured["offered_mbps"]>3 and .7<measured["delivered_mbps"]<1.35):
+        raise RuntimeError(f"outbound IPv4/IPv6 shared cap missing: {measured}")
+    if pressure["overlimits"]<3 and pressure["drops"]<3:
+        raise RuntimeError(f"outbound police did not observe pressure: {pressure}")
+    print("SEMANTIC_OUTBOUND_PASS="+json.dumps({"version":label,"pressure":pressure},
+         sort_keys=True),flush=True)
+
+
 def audit(mod,config):
     p=mod.read_json(mod.port_file(PORT))
     mod.validate_record(PORT,p)
@@ -391,6 +458,8 @@ def main():
         aggregate(mod,config,args.child_pid,root,args.label,args.seconds)
     elif args.suite=="faults":
         faults(mod,config,args.label)
+    elif args.suite=="outbound":
+        outbound(mod,config,args.child_pid,root,args.label,args.seconds)
     else:
         lifecycle(mod,config,args.child_pid,root,args.label)
     audit(mod,config)
