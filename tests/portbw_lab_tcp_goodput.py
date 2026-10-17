@@ -106,9 +106,9 @@ def police(mod):
 def run_once(args,child,mod,root,tag,port):
     results=root/"results"/"tcp_goodput"
     results.mkdir(parents=True,exist_ok=True)
-    rpath=results/f"{args.version}_{tag}_receiver.log"
-    spath=results/f"{args.version}_{tag}_sender.log"
-    before=police(mod)
+    rpath=results/f"{args.version}_{args.mode}_{tag}_receiver.log"
+    spath=results/f"{args.version}_{args.mode}_{tag}_sender.log"
+    before=police(mod) if args.mode=="both" else None
     env={**os.environ,"PORTBW_LAB_ACK":"isolated-netns-only"}
     receiver_cmd=[sys.executable,"-B",str(Path(__file__).resolve()),"receiver",
                   "--port",str(port),"--seconds",str(args.seconds),
@@ -132,12 +132,15 @@ def run_once(args,child,mod,root,tag,port):
             raise RuntimeError(f"TCP test failed {tag}: {rpath.read_text()[-800:]} {spath.read_text()[-800:]}")
         text=rpath.read_text().splitlines()
         obj=json.loads(next(x.split("GOODPUT_RECEIVER=",1)[1] for x in text if x.startswith("GOODPUT_RECEIVER=")))
-        after=police(mod)
-        delta={k:after[k]-before[k] for k in before}
-        if any(x<0 for x in delta.values()):
-            raise RuntimeError("tc police counters reset during TCP test")
+        if args.mode=="both":
+            after=police(mod)
+            delta={k:after[k]-before[k] for k in before}
+            if any(x<0 for x in delta.values()):
+                raise RuntimeError("tc police counters reset during TCP test")
+        else:
+            delta=None  # no tc police in nft_only mode
         result={
-            "version":args.version,"scenario":tag,
+            "version":args.version,"mode":args.mode,"scenario":tag,
             "port":port,"configured_up_mbps":None if port==CONTROL else int(tag),
             "receive":obj,"up_police_delta":delta
         }
@@ -162,16 +165,27 @@ def bench(args):
     child=None
     try:
         child,_=runner.set_up_link()
+        # Separate A/B and both/nft_only state. A fresh network namespace
+        # must never inherit a saved port that suppresses rule creation.
         base=str(root)
-        os.environ.update(PORTBW_STATE=base+"/state",
-                          PORTBW_CONF=base+"/config",
-                          PORTBW_LOCK=base+"/locks/manager.lock",
-                          PORTBW_RUN=base+"/run",PORTBW_UNITS=base+"/units")
+        scope=args.version+"_"+args.mode
+        os.environ.update(PORTBW_STATE=base+"/state_"+scope,
+                          PORTBW_CONF=base+"/config_"+scope,
+                          PORTBW_LOCK=base+"/locks_"+scope+"/manager.lock",
+                          PORTBW_RUN=base+"/run_"+scope,PORTBW_UNITS=base+"/units_"+scope)
         mod=runner.module(src)
-        cfg={"iface":runner.IFACE,"tc_enabled":True,"version":2}
+        cfg={"iface":runner.IFACE,"tc_enabled":args.mode=="both","version":2}
         mod.write_json(mod.CONF/"config.json",cfg)
-        mod.tc_prepare(runner.IFACE)
-        runner.prepare_ports(mod,cfg,1,False)
+        if args.mode=="both":
+            mod.tc_prepare(runner.IFACE)
+            runner.prepare_ports(mod,cfg,1,False)
+        else:
+            # Only in disposable netns. No download cap in nft-only mode.
+            rec=runner.make_rec(mod,PORT,0,False)
+            rec["down"]=0
+            mod.validate_record(PORT,rec)
+            mod.write_json(mod.port_file(PORT),rec)
+            mod.finish_apply(PORT,rec,cfg)
         runner.audit_records(mod,cfg,[PORT])
         if args.delay_ms:
             # Child netns ONLY. Never host root qdisc. ACKs remain unmodified
@@ -185,13 +199,14 @@ def bench(args):
         for tag,port in experiments:
             if port==PORT:
                 mbps=int(tag)
-                mod.commit(PORT,125000*mbps,125000*40,cfg)
+                mod.commit(PORT,125000*mbps,125000*40 if args.mode=="both" else 0,cfg)
                 runner.audit_records(mod,cfg,[PORT])
             results.append(run_once(args,child,mod,root,tag,port))
         summary={r["scenario"]:r["receive"]["steady_mbps"] for r in results}
         print("TCP_GOODPUT_SUMMARY="+json.dumps({"version":args.version,
-             "delay_ms":args.delay_ms,"steady_mbps":summary},sort_keys=True),flush=True)
-        path=root/"results"/f"goodput_{args.version}.json"
+             "mode":args.mode,"delay_ms":args.delay_ms,
+             "steady_mbps":summary},sort_keys=True),flush=True)
+        path=root/"results"/f"goodput_{args.version}_{args.mode}.json"
         path.write_text(json.dumps(results,indent=2)+"\n",encoding="utf-8")
         runner.audit_records(mod,cfg,[PORT])
     finally:
@@ -206,6 +221,7 @@ def main():
     ap.add_argument("role",choices=("bench","sender","receiver"))
     ap.add_argument("--root")
     ap.add_argument("--version",choices=("A","B"),default="B")
+    ap.add_argument("--mode",choices=("both","nft_only"),default="both")
     ap.add_argument("--port",type=int,choices=(PORT,CONTROL),default=PORT)
     ap.add_argument("--seconds",type=int,default=24)
     ap.add_argument("--warmup",type=int,default=4)
