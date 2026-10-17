@@ -7,6 +7,7 @@ on:
       - 'portbw.py'
       - 'portbw-install.sh'
       - 'tests/test_portbw_cpu_candidate.py'
+      - 'tests/test_portbw_semantic_acceptance.py'
       - 'tests/portbw_cpu_probe.py'
       - 'tests/portbw_helan_ab.sh'
       - 'tests/portbw_ab_lab_runner.py'
@@ -28,12 +29,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check Python syntax and shell syntax
         run: |
-          python3 -m py_compile portbw.py tests/test_portbw_cpu_candidate.py tests/portbw_cpu_probe.py tests/portbw_ab_lab_runner.py tests/portbw_lab_traffic.py tests/portbw_lab_semantics.py tests/portbw_lab_semantic_runner.py
+          python3 -m py_compile portbw.py tests/test_portbw_cpu_candidate.py tests/portbw_cpu_probe.py tests/portbw_ab_lab_runner.py tests/portbw_lab_traffic.py tests/portbw_lab_semantics.py tests/portbw_lab_semantic_runner.py tests/test_portbw_semantic_acceptance.py
           bash -n portbw-install.sh
           bash -n tests/portbw_helan_ab.sh
           bash -n tests/portbw_helan_semantic.sh
       - name: Run differential nft and tc regression tests
-        run: python3 -m unittest discover -s tests -p 'test_portbw_cpu_candidate.py' -v
+        run: |
+          python3 -m unittest discover -s tests -p 'test_portbw_cpu_candidate.py' -v
+          python3 -m unittest discover -s tests -p 'test_portbw_semantic_acceptance.py' -v
       - name: Verify benchmark host-namespace refusal
         shell: bash
         run: |
