@@ -117,6 +117,22 @@ def transfer(a,root,child,mod,tag,port):
             if p.poll() is None:
                 p.kill();p.wait(timeout=3)
 
+def lab_environment(root,mode):
+    """Construct private per-mode paths before any kernel mutations.
+
+    Path joining must be performed AFTER concatenating the directory name.
+    Keep explicit return values so an ordinary unit test can verify paths.
+    """
+    root=Path(root)
+    return {
+        "PORTBW_STATE":str(root/("state_"+mode)),
+        "PORTBW_CONF":str(root/("config_"+mode)),
+        "PORTBW_LOCK":str(root/("lock_"+mode)/"manager.lock"),
+        "PORTBW_RUN":str(root/("run_"+mode)),
+        "PORTBW_UNITS":str(root/("units_"+mode)),
+    }
+
+
 def bench(a):
     root=Path(a.root).resolve()
     if root.parent!=Path("/tmp") or not root.name.startswith("portbw-cpu-"):
@@ -128,12 +144,7 @@ def bench(a):
     child=None
     try:
         child,_=runner.set_up_link()
-        os.environ.update(
-            PORTBW_STATE=str(root/"state_"+a.mode),
-            PORTBW_CONF=str(root/"config_"+a.mode),
-            PORTBW_LOCK=str(root/"lock_"+a.mode/"manager.lock"),
-            PORTBW_RUN=str(root/"run_"+a.mode),
-            PORTBW_UNITS=str(root/"units_"+a.mode))
+        os.environ.update(lab_environment(root,a.mode))
         mod=runner.module(source)
         # Only adjust egress/down in this imported disposable module.
         orig=mod.tc_burst_kb
