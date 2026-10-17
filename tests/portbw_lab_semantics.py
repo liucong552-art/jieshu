@@ -204,13 +204,82 @@ def faults(mod,config,label):
     print(f"SEMANTIC_FAULT={label}: corrupt sibling isolated",flush=True)
 
 
+
+def lifecycle(mod,config,pid,root,label):
+    """High load -> hold -> idle -> restoration; real BOOTTIME and tc counters."""
+    rec=mod.read_json(mod.port_file(PORT))
+    rec["auto"]={
+        "version":mod.AUTO_VERSION,
+        "base":{"up":125000,"down":125000},
+        "limited":{"up":62500,"down":62500},
+        "trigger_bp":7000,"after":5,"hold":10,"cooldown":4,
+    }
+    mod.reset_auto_boot(rec,mod.boot_id())
+    mod.validate_record(PORT,rec)
+    mod.write_json(mod.port_file(PORT),rec)
+    mod.finish_apply(PORT,rec,config)
+    logs=root/"results"/"semantics"
+    logs.mkdir(parents=True,exist_ok=True)
+    sp=logs/(label+"_lifecycle_server.log")
+    cp=logs/(label+"_lifecycle_client.log")
+    processes=[];handles=[]
+    transitions=[]
+    try:
+        for role,path in (("server",sp),("client",cp)):
+            fp=path.open("w")
+            handles.append(fp)
+            cmd=([sys.executable,str(TRAFFIC),"server"] if role=="server"
+                 else ["nsenter","-t",str(pid),"-n",sys.executable,str(TRAFFIC),"client"])
+            cmd+=["--proto","udp","--family","ipv4","--port",str(PORT),
+                  "--seconds","24" if role=="server" else "20","--mbit","3"]
+            processes.append(subprocess.Popen(cmd,stdout=fp,stderr=subprocess.STDOUT))
+            if role=="server":time.sleep(.25)
+        for i in range(55):
+            before=mod.read_json(mod.port_file(PORT))
+            now=time.monotonic()
+            mod.reconcile(config,monitor=True)
+            current=mod.read_json(mod.port_file(PORT))
+            mod.validate_record(PORT,current)
+            state={d:current["runtime"]["dirs"][d]["phase"] for d in mod.CHAIN}
+            row={"tick":i,"phases":state,"rates":{d:current[d] for d in mod.CHAIN}}
+            transitions.append(row)
+            if i>=29 and all(current[d]==125000 and state[d] in ("monitor","cooldown")
+                             for d in mod.CHAIN):
+                # Enough time after high traffic for hold and checkpoint to unwind.
+                break
+            time.sleep(max(0,1-(time.monotonic()-now)))
+        trace=logs/(label+"_lifecycle_phases.json")
+        trace.write_text(json.dumps(transitions,indent=2)+"\n",encoding="utf-8")
+        lowered=[x for x in transitions if all(x["rates"][d]==62500 for d in mod.CHAIN)]
+        restored=[x for x in transitions if
+                  all(x["rates"][d]==125000 for d in mod.CHAIN)
+                  and x["tick"]>20]
+        if not lowered:
+            raise RuntimeError(f"{label}: no real 0.5 Mbps auto reduction, see {trace}")
+        if not restored:
+            raise RuntimeError(f"{label}: no return to 1 Mbps after hold, see {trace}")
+        if any("hold" in x["phases"].values() and
+               any(x["rates"][d]!=62500 for d in mod.CHAIN
+                   if x["phases"][d]=="hold") for x in transitions):
+            raise RuntimeError(f"{label}: hold phase with unexpected rate")
+        audit(mod,config)
+        print("SEMANTIC_LIFECYCLE="+json.dumps(
+              {"version":label,"lowered":True,"restored":True,
+               "ticks":len(transitions),"trace":str(trace)}),flush=True)
+    finally:
+        for proc in processes:
+            if proc.poll() is None:proc.terminate()
+            try:proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:proc.kill();proc.wait()
+        for fp in handles:fp.close()
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument("--source",required=True)
     p.add_argument("--root",required=True)
     p.add_argument("--child-pid",required=True,type=int)
     p.add_argument("--label",required=True)
-    p.add_argument("--suite",choices=["aggregate","faults"],required=True)
+    p.add_argument("--suite",choices=["aggregate","faults","lifecycle"],required=True)
     p.add_argument("--seconds",type=int,default=18)
     args=p.parse_args()
     guard()
@@ -224,8 +293,10 @@ def main():
     audit(mod,config)
     if args.suite=="aggregate":
         aggregate(mod,config,args.child_pid,root,args.label,args.seconds)
-    else:
+    elif args.suite=="faults":
         faults(mod,config,args.label)
+    else:
+        lifecycle(mod,config,args.child_pid,root,args.label)
     audit(mod,config)
     print("SEMANTIC_PASS="+json.dumps({"version":args.label,"suite":args.suite}),flush=True)
 
