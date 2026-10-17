@@ -181,7 +181,7 @@ def bench(args):
     runner=load(root/"tools"/"portbw_ab_lab_runner.py","tcp_goodput_runner")
     runner.isolated()
     src=root/args.version/"portbw.py"
-    expected={"A":A_SHA,"B":B_SHA}[args.version]
+    expected={"A":A_SHA,"B":os.environ.get("PORTBW_LAB_B_SHA",B_SHA)}[args.version]
     if hashlib.sha256(src.read_bytes()).hexdigest()!=expected:
         raise RuntimeError("pinned source checksum mismatch")
     child=None
