@@ -6,7 +6,7 @@ umask 077
 for c in curl python3 ip nft tc unshare nsenter sha256sum; do command -v "$c" >/dev/null; done
 ROOT=$(mktemp -d /tmp/portbw-cpu-XXXXXXXX)
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
-REF=e5819df35483dba91093e642d3c8cdc3d1b6cf0d
+REF=8df950a980741a08ed7f9c46b1273afc73142546
 mkdir -p "$ROOT"/{B,tools,results}
 echo "EGRESS_TEST_ROOT=$ROOT PINNED_REF=$REF"
 curl -fsSL --retry 3 "$BASE/$REF/portbw.py" -o "$ROOT/B/portbw.py"
