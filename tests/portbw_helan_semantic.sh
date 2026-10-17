@@ -7,8 +7,8 @@ for c in curl python3 sha256sum unshare nsenter ip nft tc; do command -v "$c" >/
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
 BRANCH=opt/portbw-cpu-snapshot-index-20261016
 # Immutable commit containing the corrected TCP backpressure checks.
-HARNESS_REF=f62af2523782b259cb255e7471ebdcaf253aac22
-HARNESS_VERSION=20261017-shared-police-pressure-v3
+HARNESS_REF=484df0a2ae43667c5e818047eb7d2e3c01faa834
+HARNESS_VERSION=20261017-shared-police-pressure-v4
 ROOT=$(mktemp -d /tmp/portbw-cpu-XXXXXXXX)
 mkdir -p "$ROOT"/{A,B,tools,results}
 echo "TEST_ROOT=$ROOT"
@@ -16,23 +16,13 @@ echo "HARNESS_VERSION=$HARNESS_VERSION"
 echo "HARNESS_REF=$HARNESS_REF"
 curl -fsSL --retry 3 "$BASE/main/portbw.py" -o "$ROOT/A/portbw.py"
 curl -fsSL --retry 3 "$BASE/$HARNESS_REF/portbw.py" -o "$ROOT/B/portbw.py"
-for f in portbw_ab_lab_runner.py portbw_lab_traffic.py portbw_lab_semantics.py portbw_lab_semantic_runner.py; do
+for f in portbw_ab_lab_runner.py portbw_lab_traffic.py portbw_lab_semantics.py portbw_lab_semantic_runner.py verify_portbw_semantic_harness.py; do
   curl -fsSL --retry 3 "$BASE/$HARNESS_REF/tests/$f" -o "$ROOT/tools/$f"
 done
 printf "%s  %s\n" "69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359" "$ROOT/A/portbw.py" "52eaa233f831236973dff6b43d8f320659b29226939ee5ba132d2b9cf31eebfb" "$ROOT/B/portbw.py" | sha256sum -c -
 # Fail before touching netns if a stale harness was downloaded from a
 # cache, or if the wrong TCP overload condition is accidentally restored.
-grep -Fq 'def check_shared_cap(scenario, sample):' "$ROOT/tools/portbw_lab_semantics.py" || {
-  echo 'ERROR: corrected semantic gate missing; STOP before A/B' >&2; exit 1;
-}
-if grep -Fq 'if src["offered_mbps"]<2.3:' "$ROOT/tools/portbw_lab_semantics.py"; then
-  echo 'ERROR: obsolete TCP=UDP overload threshold detected; STOP' >&2; exit 1
-fi
-grep -Fq 'def police_stats(mod, direction="up"):' "$ROOT/tools/portbw_lab_semantics.py" || {
-  echo 'ERROR: missing required tc police counter validation' >&2; exit 1
-}
-echo 'HARNESS_GATE=CORRECTED_TCP_BACKPRESSURE'
-echo 'HARNESS_GATE=ACTUAL_TC_POLICE_COUNTERS'
+python3 -B "$ROOT/tools/verify_portbw_semantic_harness.py" "$ROOT/tools/portbw_lab_semantics.py"
 python3 -m py_compile "$ROOT"/tools/*.py "$ROOT/A/portbw.py" "$ROOT/B/portbw.py"
 export PORTBW_LAB_ACK=isolated-netns-only
 case "${SEMANTIC_SUITES:-all}" in
