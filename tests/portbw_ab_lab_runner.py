@@ -190,21 +190,31 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, auto
         cmd = [sys.executable, str(probe), str(source), "--rounds",
                str(seconds), "--warmup", "3", "--interval", "1",
                "--label", trial_name]
-        result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
-        (output / f"{trial_name}_stdout.log").write_text(result.stdout,encoding="utf-8")
-        (output / f"{trial_name}_stderr.log").write_text(result.stderr,encoding="utf-8")
-        for line in result.stdout.splitlines():
-            if line.startswith("PORTBW_PROBE_PROGRESS="):
-                print(line, flush=True)
-        if result.returncode:
-            raise RuntimeError(f"trial {trial_name} failed: {result.stderr[-1200:] or result.stdout[-1200:]}")
-        markers=[line[len("PORTBW_PROBE_RESULT="):] for line in result.stdout.splitlines()
+        # Stream progress while the child is running, not after the 1h
+        # subprocess exits. Full unfiltered stdout/stderr remain on disk.
+        stdout_path=output / f"{trial_name}_stdout.log"
+        stderr_path=output / f"{trial_name}_stderr.log"
+        lines=[]
+        with stderr_path.open("w",encoding="utf-8") as err:
+            proc=subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE,
+                                  stderr=err,bufsize=1)
+            with stdout_path.open("w",encoding="utf-8") as out:
+                for line in proc.stdout:
+                    out.write(line)
+                    lines.append(line)
+                    if line.startswith("PORTBW_PROBE_PROGRESS="):
+                        print(line.rstrip(),flush=True)
+            code=proc.wait()
+        stdout="".join(lines)
+        if code:
+            raise RuntimeError(f"trial {trial_name} failed: "
+                               f"{stderr_path.read_text()[-1200:] or stdout[-1200:]}")
+        markers=[line[len("PORTBW_PROBE_RESULT="):] for line in stdout.splitlines()
                  if line.startswith("PORTBW_PROBE_RESULT=")]
         if len(markers)!=1:raise RuntimeError(f"trial {trial_name}: missing/multiple CPU result markers")
         data = json.loads(markers[0])
         if automatic and traffic == "udp" and seconds >= 30:
-            transitions=[line for line in result.stdout.splitlines()
+            transitions=[line for line in stdout.splitlines()
                          if f"{PORT} " in line and "自动降速" in line]
             if not transitions:
                 raise RuntimeError(
