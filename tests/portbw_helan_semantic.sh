@@ -7,8 +7,8 @@ for c in curl python3 sha256sum unshare nsenter ip nft tc; do command -v "$c" >/
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
 BRANCH=opt/portbw-cpu-snapshot-index-20261016
 # Immutable commit containing the corrected TCP backpressure checks.
-HARNESS_REF=484df0a2ae43667c5e818047eb7d2e3c01faa834
-HARNESS_VERSION=20261017-shared-police-pressure-v4
+HARNESS_REF=9b16eee4cf17e4ccc39ccc059fe5a59b5d08e1d7
+HARNESS_VERSION=20261017-outbound-semantic-v5
 ROOT=$(mktemp -d /tmp/portbw-cpu-XXXXXXXX)
 mkdir -p "$ROOT"/{A,B,tools,results}
 echo "TEST_ROOT=$ROOT"
