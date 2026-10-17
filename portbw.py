@@ -591,8 +591,18 @@ def _quantity_bytes(number,unit):
             'ki':1024,'mi':1024**2,'gi':1024**3}
     return Decimal(number)*factor[unit.lower()]
 
-def tc_burst_kb(rate):
-    return max(64,min(1024,(rate//10+1023)//1024))
+def tc_burst_kb(rate,direction='down'):
+    # Ingress policing with a small (0.1s) bucket severely underdelivers
+    # TCP goodput on GSO/TSO traffic: on Helan 20 Mbps -> ~9.4 Mbps.
+    # Isolated kernel trials showed 1 MiB restores ~20 Mbps while retaining
+    # both nft DROP and a single shared tc action across TCP/UDP and v4/v6.
+    # Permit at most ~0.5s of tokens, capped at 1 MiB. Keep the existing
+    # smaller egress bucket until its own TCP behaviour has been verified.
+    if direction=='up':
+        return max(64,min(1024,(rate+2047)//2048))
+    if direction=='down':
+        return max(64,min(1024,(rate//10+1023)//1024))
+    raise Error('未知 tc 限速方向')
 
 def _tc_filter_body(text,port,direction,family,transport,pref):
     protocol=tc_protocol(family)
@@ -652,7 +662,7 @@ def tc_rate_is_ok(entry,b,iface,direction,port,family,transport,rec,text=None,ch
         bm=re.search(r'\bburst\s+([0-9]+(?:\.[0-9]+)?)([kKmMgG]?)b\b',line)
         if not bm:return False
         actual_burst=_quantity_bytes(bm.group(1),bm.group(2))
-        desired_burst=Decimal(tc_burst_kb(b)*1024)
+        desired_burst=Decimal(tc_burst_kb(b,direction)*1024)
         if check_rate and abs(actual_burst-desired_burst)>max(Decimal(256),desired_burst*Decimal('0.05')):return False
         if not re.search(r'\baction drop(?:/ok)?(?:\s|$)',line):return False
         return True
@@ -705,7 +715,7 @@ def apply_tc(port,rec,iface):
                            for _,_,f,t,_,old in theirs)):
                 raise Error(f'{port}: {direction} action 归属/绑定异常，拒绝原位改速')
             run(['tc','actions','replace','action','police','rate',f'{rec[direction]*8}bit',
-                 'burst',f'{tc_burst_kb(rec[direction])}k','conform-exceed','drop/ok',
+                 'burst',f'{tc_burst_kb(rec[direction],direction)}k','conform-exceed','drop/ok',
                  'index',str(index),'skip_hw'])
             continue
         if not existing and tc_action_exists(index):
@@ -725,7 +735,7 @@ def apply_tc(port,rec,iface):
         if existing:
             tc_gc_unbound_police(port,index)
         if rec[direction]==0:continue
-        kb=tc_burst_kb(rec[direction])
+        kb=tc_burst_kb(rec[direction],direction)
         for n,(_,_,family,transport,pref,_) in enumerate(theirs):
             field='dst_port' if direction=='up' else 'src_port'
             cmd=['tc','filter','add','dev',iface,tcdir,'protocol',tc_protocol(family),
