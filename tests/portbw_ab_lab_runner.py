@@ -240,7 +240,11 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, auto
                 server_data = json.loads(server_result.read_text().strip().splitlines()[-1])
                 client_data = json.loads(client_result.read_text().strip().splitlines()[-1])
             except (ValueError, IndexError) as exc:
-                raise RuntimeError("cannot parse UDP traffic results") from exc
+                raise RuntimeError(
+                    f"{trial_name}: invalid {proto}/{family} traffic logs; "
+                    f"server={server_result.read_text()[-2000:]!r}; "
+                    f"client={client_result.read_text()[-2000:]!r}"
+                ) from exc
             # The shared ingress cap is 1 Mbps (auto mode 0.5 Mbps after
             # trigger); demand a genuine overload and a nonzero delivered flow.
             # Include generous scheduling and burst tolerance: this is a
@@ -260,9 +264,9 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, auto
                 if not (0.05 < rx_rate <= 1.55 and client_data.get("tx_bytes",0)>0):
                     raise RuntimeError(f"{trial_name}: TCP rate/connection invalid: {rx_rate:.3f} Mbps")
             if client_data.get("rx_bytes", 0) <= 0:
-                raise RuntimeError(f"{trial_name}: no UDP echo packets received")
-            print(json.dumps({"trial": trial_name, "udp_offered_mbps": round(tx_rate,3),
-                              "udp_delivered_mbps": round(rx_rate,3),
+                raise RuntimeError(f"{trial_name}: no {proto}/{family} echo packets received")
+            print(json.dumps({"trial": trial_name, "offered_mbps": round(tx_rate,3), "transport":proto,"family":family,
+                              "delivered_mbps": round(rx_rate,3),
                               "udp_send_errors": client_data["send_errors"]}),
                   flush=True)
 
