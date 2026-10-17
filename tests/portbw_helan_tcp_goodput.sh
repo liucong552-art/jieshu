@@ -6,7 +6,7 @@ umask 077
 for c in curl sha256sum python3 ip nft tc unshare nsenter; do command -v "$c" >/dev/null || exit 1; done
 ROOT=$(mktemp -d /tmp/portbw-cpu-XXXXXXXX)
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
-REF=7a3bfc157d6d17bf200a4aef9b476d4fadaa5382
+REF=ce4dab0459536fec61bef907657b698138c42020
 mkdir -p "$ROOT"/{A,B,tools,results}
 echo "TCP_GOODPUT_ROOT=$ROOT PINNED_REF=$REF"
 curl -fsSL --retry 3 "$BASE/main/portbw.py" -o "$ROOT/A/portbw.py"
@@ -20,7 +20,7 @@ printf '%s  %s\n' \
 python3 -m py_compile "$ROOT"/tools/*.py
 export PORTBW_LAB_ACK=isolated-netns-only
 for version in A B; do
-  for mode in both nft_only; do
+  for mode in both nft_only tc_only tc_burst_1m tc_burst_4m; do
   echo "==== TCP GOODPUT version=$version mode=$mode 0ms ===="
   unshare --net -- python3 -B "$ROOT/tools/portbw_lab_tcp_goodput.py" bench --root "$ROOT" --version "$version" --mode "$mode" --seconds 24 --warmup 4 --delay-ms 0 2>&1 | tee "$ROOT/results/goodput_${version}_${mode}_0ms.log"
   if [[ "${TCP_DELAY_MS:-0}" != 0 ]]; then
