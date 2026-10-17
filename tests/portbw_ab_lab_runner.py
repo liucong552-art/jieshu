@@ -194,6 +194,9 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, auto
                                 stderr=subprocess.PIPE)
         (output / f"{trial_name}_stdout.log").write_text(result.stdout,encoding="utf-8")
         (output / f"{trial_name}_stderr.log").write_text(result.stderr,encoding="utf-8")
+        for line in result.stdout.splitlines():
+            if line.startswith("PORTBW_PROBE_PROGRESS="):
+                print(line, flush=True)
         if result.returncode:
             raise RuntimeError(f"trial {trial_name} failed: {result.stderr[-1200:] or result.stdout[-1200:]}")
         markers=[line[len("PORTBW_PROBE_RESULT="):] for line in result.stdout.splitlines()
