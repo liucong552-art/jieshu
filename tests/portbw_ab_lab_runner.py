@@ -143,7 +143,7 @@ def set_up_link():
         raise
 
 
-def run_trial(name, source, root, seconds, index, mode, child_pid, traffic):
+def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, automatic=False):
     trial_name = f"{index:02d}_{name}_{mode}"
     output = root / "results"
     output.mkdir(parents=True, exist_ok=True)
@@ -184,6 +184,15 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic):
                  if line.startswith("PORTBW_PROBE_RESULT=")]
         if len(markers)!=1:raise RuntimeError(f"trial {trial_name}: missing/multiple CPU result markers")
         data = json.loads(markers[0])
+        if automatic and traffic == "udp" and seconds >= 30:
+            transitions=[line for line in result.stdout.splitlines()
+                         if f"{PORT} " in line and "自动降速" in line]
+            if not transitions:
+                raise RuntimeError(
+                    f"{trial_name}: sustained UDP did not activate automatic throttling; "
+                    "inspect raw stdout, tc counters, and sampling continuity")
+            print(json.dumps({"trial":trial_name,"automatic_throttling_events":transitions},
+                             ensure_ascii=False),flush=True)
         (output / f"{trial_name}.json").write_text(
             json.dumps(data, ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
         print(json.dumps({"trial": trial_name, "rounds": data["completed_rounds"],
@@ -216,13 +225,22 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic):
                 client_data = json.loads(client_result.read_text().strip().splitlines()[-1])
             except (ValueError, IndexError) as exc:
                 raise RuntimeError("cannot parse UDP traffic results") from exc
-            # This is a smoke-test upper bound, not an exact throughput claim.
-            # The 1 Mbps UDP upload policer should never forward 3 Mbps.
-            if not (client_data.get("tx_bytes", 0) > 0
-                    and server_data.get("rx_bytes", 0) >= 0):
-                raise RuntimeError("UDP generator did not produce valid traffic data")
-            print(json.dumps({"trial": trial_name, "udp_sent_bytes": client_data["tx_bytes"],
-                              "udp_server_rx_bytes": server_data["rx_bytes"],
+            # The shared ingress cap is 1 Mbps (auto mode 0.5 Mbps after
+            # trigger); demand a genuine overload and a nonzero delivered flow.
+            # Include generous scheduling and burst tolerance: this is a
+            # useful gross-bypass test, NOT an SLA-accurate bandwidth test.
+            tx_rate=client_data.get("tx_bytes",0)*8/(client_data.get("seconds",1)*1000000)
+            rx_rate=server_data.get("rx_bytes",0)*8/(client_data.get("seconds",1)*1000000)
+            if tx_rate < 1.4:
+                raise RuntimeError(f"{trial_name}: UDP load too weak: offered={tx_rate:.3f} Mbps")
+            if not (0.05 < rx_rate <= 1.55 and rx_rate < tx_rate * 0.9):
+                raise RuntimeError(
+                    f"{trial_name}: ingress policing not proven: offered={tx_rate:.3f}, "
+                    f"received={rx_rate:.3f} Mbps (expected <=1 Mbps + tolerance)")
+            if client_data.get("rx_bytes", 0) <= 0:
+                raise RuntimeError(f"{trial_name}: no UDP echo packets received")
+            print(json.dumps({"trial": trial_name, "udp_offered_mbps": round(tx_rate,3),
+                              "udp_delivered_mbps": round(rx_rate,3),
                               "udp_send_errors": client_data["send_errors"]}),
                   flush=True)
 
@@ -289,7 +307,8 @@ def main():
                 audit_records(mod, config, ports)
                 src = srcA if name == "A" else srcB
                 data = run_trial(name, src, root, args.seconds,
-                                 count, args.traffic, child.pid, args.traffic)
+                                 count, args.traffic, child.pid, args.traffic,
+                                 automatic=args.auto)
                 audit_records(mod, config, ports)
                 trials.append({"policy_count": count, "version": name,
                                "cpu_total": data["process_plus_children_one_core_pct"],
