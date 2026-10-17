@@ -231,12 +231,18 @@ def run_trial(name, source, root, seconds, index, mode, child_pid, traffic, auto
             # useful gross-bypass test, NOT an SLA-accurate bandwidth test.
             tx_rate=client_data.get("tx_bytes",0)*8/(client_data.get("seconds",1)*1000000)
             rx_rate=server_data.get("rx_bytes",0)*8/(client_data.get("seconds",1)*1000000)
-            if tx_rate < 1.4:
-                raise RuntimeError(f"{trial_name}: UDP load too weak: offered={tx_rate:.3f} Mbps")
-            if not (0.05 < rx_rate <= 1.55 and rx_rate < tx_rate * 0.9):
-                raise RuntimeError(
-                    f"{trial_name}: ingress policing not proven: offered={tx_rate:.3f}, "
-                    f"received={rx_rate:.3f} Mbps (expected <=1 Mbps + tolerance)")
+            if proto == "udp":
+                if tx_rate < 1.4:
+                    raise RuntimeError(f"{trial_name}: UDP load too weak: offered={tx_rate:.3f} Mbps")
+                if not (0.05 < rx_rate <= 1.55 and rx_rate < tx_rate * 0.9):
+                    raise RuntimeError(
+                        f"{trial_name}: ingress policing not proven: offered={tx_rate:.3f}, "
+                        f"received={rx_rate:.3f} Mbps (expected <=1 Mbps + tolerance)")
+            else:
+                # TCP backpressure can reduce sender's actual transmitted
+                # bytes; do not demand an impossible UDP-like overload ratio.
+                if not (0.05 < rx_rate <= 1.55 and client_data.get("tx_bytes",0)>0):
+                    raise RuntimeError(f"{trial_name}: TCP rate/connection invalid: {rx_rate:.3f} Mbps")
             if client_data.get("rx_bytes", 0) <= 0:
                 raise RuntimeError(f"{trial_name}: no UDP echo packets received")
             print(json.dumps({"trial": trial_name, "udp_offered_mbps": round(tx_rate,3),
