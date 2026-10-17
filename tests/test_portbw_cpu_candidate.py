@@ -272,6 +272,28 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(idx['generation'][(port,'down')],[12])
         self.assertEqual(set(idx['objects'][port]),set(portbw.owned(items,port)[1]))
 
+class BurstPolicyTests(unittest.TestCase):
+    def test_ingress_tcp_20_40_mbps_receive_1m_burst(self):
+        self.assertEqual(portbw.tc_burst_kb(20*125000,'up'),1024)
+        self.assertEqual(portbw.tc_burst_kb(40*125000,'up'),1024)
+
+    def test_egress_unchanged(self):
+        for rate in (125000,2500000,5000000,12500000):
+            self.assertEqual(portbw.tc_burst_kb(rate,'down'),
+                             max(64,min(1024,(rate//10+1023)//1024)))
+
+    def test_ingress_bounded_and_monotonic(self):
+        values=[portbw.tc_burst_kb(n,'up') for n in
+                (1500,125000,500000,1250000,2500000,5000000,12500000,12500000000)]
+        self.assertEqual(values,sorted(values))
+        self.assertTrue(all(64<=n<=1024 for n in values))
+        self.assertEqual(values[0],64)
+        self.assertEqual(values[-1],1024)
+
+    def test_unrecognized_direction_rejected(self):
+        with self.assertRaises(portbw.Error):
+            portbw.tc_burst_kb(125000,'unknown')
+
 
 if __name__ == '__main__':
     unittest.main()
