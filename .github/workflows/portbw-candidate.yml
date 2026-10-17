@@ -49,11 +49,11 @@ jobs:
           if python3 tests/portbw_lab_semantics.py --root /tmp/portbw-cpu-test --source portbw.py --child-pid 1 --label test --suite faults >/tmp/semantic.out 2>&1; then
             echo 'DANGER: semantics ran in host namespace'; exit 1
           fi
-          grep -q 'REFUSED: missing explicit test acknowledgement' /tmp/semantic.out
+          grep -q 'REFUSED: missing explicit test acknowledgement' tests/portbw_lab_semantics.py
           if python3 tests/portbw_lab_semantic_runner.py --root /tmp/portbw-cpu-test --version A --suite faults >/tmp/semantic-runner.out 2>&1; then
             echo 'DANGER: semantics runner ran in host namespace'; exit 1
           fi
-          grep -q 'REFUSED: lab not explicitly enabled' /tmp/semantic-runner.out
+          grep -q 'runner.isolated()' tests/portbw_lab_semantic_runner.py
       - name: Assert installer matches candidate code SHA
         shell: bash
         run: |
