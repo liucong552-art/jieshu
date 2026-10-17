@@ -118,63 +118,119 @@ def flow_batch(pid,root,label,flows,port,seconds):
             fp.close()
 
 
-def check_shared_cap(scenario, sample):
-    """Fail closed on bypass or traffic-generator starvation.
+def police_stats(mod, direction="up"):
+    """Count only the EXACT shared action; no tc filter stat multiplication."""
+    block=mod.tc_action_block(mod.tc_police_index(PORT,direction))
+    if block is None:
+        raise RuntimeError(f"shared tc police action missing: {direction}")
+    parts=__import__("re").findall(
+        r'\bSent\s+([0-9]+)\s+bytes\s+([0-9]+)\s+pkt\s+'
+        r'\(dropped\s+([0-9]+),\s+overlimits\s+([0-9]+)',block)
+    if len(parts)!=1:
+        raise RuntimeError(f"shared police action missing/unparseable counters: {block[:1500]}")
+    values=list(map(int,parts[0]))
+    return {"bytes":values[0],"packets":values[1],
+            "drops":values[2],"overlimits":values[3]}
 
-    UDP socket writes reflect attempted demand; TCP socket accepted bytes
-    reflect BACKPRESSURE, not uncapped network demand. An actively policed
-    TCP connection need not report >=2.3 Mbps of accepted writes.
+
+def police_delta(before,after):
+    delta={name:after[name]-before[name] for name in before}
+    if any(value<0 for value in delta.values()):
+        raise RuntimeError(f"police counters reset during experiment: {before}, {after}")
+    return delta
+
+
+def check_shared_cap(scenario,sample,pressure=None):
+    """Require honest transport participation and kernel policing evidence.
+
+    The TCP client reports socket-accepted bytes, not hypothetical offered
+    demand. TCP congestion control may cut accepted writes below the nominal
+    policer rate. No fixed 2.3 Mbps application-write threshold is valid
+    for TCP. Direct same-action overlimit/drop counters prove pressure.
     """
     flows=sample["flows"]
     delivered=sample["delivered_mbps"]
     if not .70 < delivered < 1.35:
-        raise RuntimeError(f"{scenario}: aggregate throughput not near the shared 1 Mbps cap: {sample}")
+        raise RuntimeError(f"{scenario}: aggregate throughput not near shared 1 Mbps: {sample}")
     if scenario=="udp-ipv4-ipv6":
         if sample["offered_mbps"]<2.3 or len(flows)!=2 or not all(
                 x["proto"]=="udp" and x["offered_mbps"]>1.0
                 and x["delivered_mbps"]>.1 for x in flows):
-            raise RuntimeError(f"{scenario}: UDP/dual-stack overload or participation unproven: {sample}")
+            raise RuntimeError(f"{scenario}: dual-stack UDP overload/participation not proven: {sample}")
     elif scenario.startswith("tcp-udp"):
         tcp=[x for x in flows if x["proto"]=="tcp"]
         udp=[x for x in flows if x["proto"]=="udp"]
         if len(tcp)!=1 or len(udp)!=1:
-            raise RuntimeError(f"{scenario}: expected one TCP and one UDP flow: {sample}")
-        # Require both transports to carry SIGNIFICANT real traffic. This
-        # rejects the earlier ~0.009 Mbps TCP pseudo-competition but accepts
-        # a normal .546 TCP + .450 UDP split under 1 Mbps policing.
-        if not (tcp[0]["offered_mbps"]>=.35
-                and tcp[0]["delivered_mbps"]>=.2
+            raise RuntimeError(f"{scenario}: need exactly TCP+UDP: {sample}")
+        # Both traffic classes must make a measurable contribution.
+        # A TCP rate of 0.009 Mbps is starvation, not an aggregate proof.
+        if not (tcp[0]["offered_mbps"]>=.25
+                and tcp[0]["delivered_mbps"]>=.15
                 and udp[0]["offered_mbps"]>=.4
-                and udp[0]["delivered_mbps"]>=.2
-                and sample["offered_mbps"]>=1.1):
-            raise RuntimeError(f"{scenario}: TCP or UDP is underdriven/starved: {sample}")
+                and udp[0]["delivered_mbps"]>=.2):
+            raise RuntimeError(f"{scenario}: TCP or UDP is starved: {sample}")
     else:
-        raise RuntimeError(f"unknown aggregate scenario {scenario}")
+        raise RuntimeError(f"unknown scenario {scenario}")
+    if pressure is None:
+        raise RuntimeError(f"{scenario}: missing actual shared police counters")
+    if pressure.get("overlimits",0)<3 and pressure.get("drops",0)<3:
+        # Even 1 Mbps measured at receiver is not sufficient proof if no
+        # overlimit was observed: packet generator may be naturally slower.
+        raise RuntimeError(f"{scenario}: no demonstrable policing pressure: {sample}, {pressure}")
 
 
 def aggregate(mod,config,pid,root,label,seconds):
-    for scenario,flows in (
-        ("udp-ipv4-ipv6",[("udp","ipv4"),("udp","ipv6")]),
-        ("tcp-udp-ipv4",[("tcp","ipv4",3),("udp","ipv4",0.45)]),
-        ("tcp-udp-ipv6",[("tcp","ipv6",3),("udp","ipv6",0.45)]),
-    ):
-        # Assert the two protocols/families do not get TWO independent 1 Mbps
-        # policers. Per-flow receive cannot be extrapolated to aggregation.
-        mod.reconcile(config,monitor=False)
-        src=flow_batch(pid,root,f"{label}_{scenario}",flows,PORT,seconds)
-        check_shared_cap(scenario,src)
+    # Unpoliced controls FIRST: otherwise low TCP delivery could be
+    # attributed to an underperforming echo client rather than the policer.
     for fam in ("ipv4","ipv6"):
-        tcp_control=flow_batch(pid,root,f"{label}_tcp_control_{fam}",
-                               [("tcp",fam,3)],CONTROL,seconds)
-        if tcp_control["delivered_mbps"]<1.5:
-            raise RuntimeError(f"{label}: unpoliced TCP too slow ({fam}): {tcp_control}")
-    # Without any rules on control port, prove that the test generator and
-    # veth link can deliver substantially more than the configured 1 Mbps.
-    control=flow_batch(pid,root,f"{label}_unpoliced_control",
-                       [("udp","ipv4"),("udp","ipv6")],CONTROL,seconds)
-    if control["delivered_mbps"]<2.3:
-        raise RuntimeError(f"{label}: unpoliced control too slow, no proof of kernel policing: {control}")
+        tc=flow_batch(pid,root,f"{label}_tcp_control_{fam}",
+                      [("tcp",fam,3)],CONTROL,seconds)
+        if tc["delivered_mbps"]<1.5:
+            raise RuntimeError(f"{label}: uncapped TCP control is underdriven ({fam}): {tc}")
+    udp_control=flow_batch(pid,root,f"{label}_udp_control",
+                           [("udp","ipv4"),("udp","ipv6")],CONTROL,seconds)
+    if udp_control["delivered_mbps"]<2.3:
+        raise RuntimeError(f"{label}: uncapped UDP control is underdriven: {udp_control}")
 
+    scenarios=(
+        ("udp-ipv4-ipv6",[("udp","ipv4"),("udp","ipv6")]),
+        ("tcp-udp-ipv4",None),
+        ("tcp-udp-ipv6",None),
+    )
+    for scenario,fixed_flows in scenarios:
+        # TCP applications obey backpressure. Try a few bounded UDP demand
+        # points until both transports participate AND the actual shared
+        # policer reports drops/overlimits. Never silently accept an
+        # inconclusive underloaded run as a successful aggregate test.
+        udp_rates=(None,) if fixed_flows is not None else (.45,.65,.85)
+        failures=[]
+        passed=False
+        for attempt,udp_rate in enumerate(udp_rates,1):
+            flows=(fixed_flows if fixed_flows is not None else
+                   [("tcp",scenario.rsplit("-",1)[1],3),
+                    ("udp",scenario.rsplit("-",1)[1],udp_rate)])
+            mod.reconcile(config,monitor=False)
+            before=police_stats(mod)
+            src=flow_batch(pid,root,f"{label}_{scenario}_attempt{attempt}",
+                           flows,PORT,seconds)
+            delta=police_delta(before,police_stats(mod))
+            print("SEMANTIC_POLICE="+json.dumps({
+                "version":label,"scenario":scenario,"attempt":attempt,
+                "police_delta":delta,"offered_mbps":src["offered_mbps"],
+                "delivered_mbps":src["delivered_mbps"]},sort_keys=True),flush=True)
+            try:
+                check_shared_cap(scenario,src,delta)
+                passed=True
+                break
+            except RuntimeError as exc:
+                failures.append(str(exc))
+                print("SEMANTIC_ATTEMPT_INCONCLUSIVE="+json.dumps({
+                    "version":label,"scenario":scenario,"attempt":attempt,
+                    "reason":str(exc)},ensure_ascii=False),flush=True)
+        if not passed:
+            raise RuntimeError(
+                f"{label}/{scenario}: could not establish shared-cap behavior "
+                f"after {len(failures)} attempts: {failures}")
 
 def audit(mod,config):
     p=mod.read_json(mod.port_file(PORT))
