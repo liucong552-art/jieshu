@@ -162,7 +162,10 @@ def bench(a):
         mod.tc_prepare(runner.IFACE)
         runner.prepare_ports(mod,cfg,1,False)
         runner.audit_records(mod,cfg,[PORT])
-        results=[transfer(a,root,child,mod,"control",CONTROL_PORT)]
+        # Original-mode control already proved local veth has >6 Gbps headroom.
+        # Skipping it in continuation avoids stressing Helan with unregulated
+        # 6 Gbps TCP when only limited-mode goodput is in question.
+        results=[] if a.skip_control else [transfer(a,root,child,mod,"control",CONTROL_PORT)]
         for n in (40,20,5):
             # Upload is zero; ONLY this port's source/egress traffic is limited.
             mod.commit(PORT,0,n*125000,cfg)
@@ -185,6 +188,7 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument("role",choices=["bench","sender","receiver"])
     p.add_argument("--root")
+    p.add_argument("--skip-control",action="store_true",help="do not repeat measured multi-Gbps control")
     p.add_argument("--mode",choices=["original","half_second","one_meg"],default="original")
     p.add_argument("--source-port",type=int,choices=[PORT,CONTROL_PORT],default=PORT)
     p.add_argument("--seconds",type=int,default=20)
