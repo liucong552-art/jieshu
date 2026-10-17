@@ -63,10 +63,11 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--interval", type=float, default=1.0)
     p.add_argument("--label", default="unlabeled")
+    p.add_argument("--segment-rounds", type=int, default=300, help="Emit CPU/latency progress each N rounds")
     p.add_argument("--profile", default="", help="Optional profiler output; use in SEPARATE diagnostic run")
     args = p.parse_args()
     check_isolation()
-    if args.rounds < 1 or not 0 <= args.warmup <= 20 or not 0.5 <= args.interval <= 10:
+    if args.rounds < 1 or args.segment_rounds < 1 or not 0 <= args.warmup <= 20 or not 0.5 <= args.interval <= 10:
         p.error("invalid sampling parameters")
     if args.profile and not args.profile.startswith("/tmp/portbw-cpu-"):
         p.error("--profile must be a /tmp/portbw-cpu-* path")
@@ -122,6 +123,7 @@ def main():
         profile = cProfile.Profile()
 
     laps, pycpu, childcpu = [], [], []
+    segments = []
     errors = []
     try:
         # Warm up; measured rounds must not include initial rule repair.
@@ -129,6 +131,9 @@ def main():
             mod.reconcile(config, monitor=True)
         starting_stats = proc_stat()
         start_wall = time.perf_counter()
+        segment_wall_start = start_wall
+        segment_index_start = 0
+        segment_command_start = 0
         active = True
         if profile:
             profile.enable()
@@ -145,6 +150,31 @@ def main():
             pycpu.append(time.process_time() - py_start)
             childcpu.append(children_cpu() - child_start)
             time.sleep(max(0.0, args.interval - duration))
+            if ((i+1) % args.segment_rounds == 0 or i+1 == args.rounds):
+                segment_end = time.perf_counter()
+                seg_laps = laps[segment_index_start:]
+                seg_py = sum(pycpu[segment_index_start:])
+                seg_children = sum(childcpu[segment_index_start:])
+                seg_elapsed = segment_end - segment_wall_start
+                seg_calls = Counter(x["command"] for x in all_calls[segment_command_start:])
+                seg = {
+                    "rounds": len(seg_laps),
+                    "start_round": segment_index_start+1,
+                    "end_round": i+1,
+                    "elapsed_seconds": round(seg_elapsed,3),
+                    "process_cpu_pct": round(100*seg_py/seg_elapsed,3) if seg_elapsed else None,
+                    "process_plus_children_cpu_pct": round(100*(seg_py+seg_children)/seg_elapsed,3) if seg_elapsed else None,
+                    "round_wall_ms_mean": round(1000*statistics.mean(seg_laps),3),
+                    "round_wall_ms_p95": round(1000*percentile(seg_laps,.95),3),
+                    "round_overruns": sum(x>args.interval for x in seg_laps),
+                    "commands": dict(seg_calls),
+                }
+                segments.append(seg)
+                print("PORTBW_PROBE_PROGRESS="+json.dumps({"label":args.label,**seg},
+                       ensure_ascii=False,sort_keys=True),flush=True)
+                segment_wall_start = segment_end
+                segment_index_start = i+1
+                segment_command_start = len(all_calls)
         if profile:
             profile.disable()
         elapsed = time.perf_counter() - start_wall
@@ -186,6 +216,9 @@ def main():
         "machine_busy_pct": round(machine_busy, 3) if machine_busy is not None else None,
         "cpu_count_for_equivalent": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(),
         "machine_one_core_equivalent_pct": round(machine_busy * (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()), 3) if machine_busy is not None else None,
+        "cpu_segments": segments,
+        "peak_self_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "round_overruns_total": sum(x>args.interval for x in laps),
         "round_wall_ms": {
             "mean": round(1000 * statistics.mean(laps), 3) if laps else None,
             "max": round(1000 * max(laps), 3) if laps else None,
