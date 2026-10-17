@@ -76,10 +76,13 @@ jobs:
             echo 'DANGER: semantics runner ran in host namespace'; exit 1
           fi
           grep -q 'runner.isolated()' tests/portbw_lab_semantic_runner.py
-      - name: Fail closed on unvalidated installer
+      - name: Assert Helan test installer pins fixed source
         run: |
-          test "$(sha256sum portbw.py | awk '{print $1}')" != "$(sed -n "s/^EXPECTED_SHA='\\([a-f0-9]*\\)'$/\\1/p" portbw-install.sh)"
-          echo 'FIX EXPERIMENT ONLY: existing installer MUST NOT accept this source until kernel semantic tests pass.'
+          actual="$(sha256sum portbw.py | awk '{print $1}')"
+          expected="$(sed -n "s/^EXPECTED_SHA='\\([a-f0-9]*\\)'$/\\1/p" portbw-install.sh)"
+          test -n "$expected"
+          test "$actual" = "$expected"
+          grep -q 'REF=035c262ff1340aa028793f8d7f7a9b6ec5b990db' portbw-onekey.sh
       - name: Guard production branch and production mode
         run: |
           test "${GITHUB_REF_NAME}" = "fix/portbw-tcp-goodput-burst-20261017"
