@@ -255,7 +255,7 @@ def lifecycle(mod,config,pid,root,label):
             state={d:current["runtime"]["dirs"][d]["phase"] for d in mod.CHAIN}
             row={"tick":i,"phases":state,"rates":{d:current[d] for d in mod.CHAIN}}
             transitions.append(row)
-            if i>=29 and all(current[d]==125000 and state[d] in ("monitor","cooldown")
+            if i>=36 and all(current[d]==125000 and state[d]=="monitor"
                              for d in mod.CHAIN):
                 # Enough time after high traffic for hold and checkpoint to unwind.
                 break
@@ -270,6 +270,10 @@ def lifecycle(mod,config,pid,root,label):
             raise RuntimeError(f"{label}: no real 0.5 Mbps auto reduction, see {trace}")
         if not restored:
             raise RuntimeError(f"{label}: no return to 1 Mbps after hold, see {trace}")
+        cooldown=[x for x in transitions if all(x["phases"][d]=="cooldown" for d in mod.CHAIN)]
+        if not cooldown:raise RuntimeError(f"{label}: cooldown phase missing: {trace}")
+        if not any(x["tick"]>cooldown[0]["tick"] and all(x["phases"][d]=="monitor" for d in mod.CHAIN) for x in transitions):
+            raise RuntimeError(f"{label}: no transition from cooldown to monitor: {trace}")
         if any("hold" in x["phases"].values() and
                any(x["rates"][d]!=62500 for d in mod.CHAIN
                    if x["phases"][d]=="hold") for x in transitions):
