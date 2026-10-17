@@ -59,7 +59,8 @@ def flow_batch(pid,root,label,flows,port,seconds):
     workers=[]
     results=[]
     try:
-        for i,(proto,family) in enumerate(flows):
+        for i,flow in enumerate(flows):
+            proto,family=flow[:2]
             name=f"{label}_{i}_{proto}_{family}"
             serverpath=logs / (name+"_server.log")
             fp=serverpath.open("w")
@@ -69,14 +70,15 @@ def flow_batch(pid,root,label,flows,port,seconds):
                                stdout=fp,stderr=subprocess.STDOUT)
             workers.append((p,fp,serverpath,"server"))
         time.sleep(.6)
-        for i,(proto,family) in enumerate(flows):
+        for i,flow in enumerate(flows):
+            proto,family=flow[:2]
             name=f"{label}_{i}_{proto}_{family}"
             path=logs / (name+"_client.log")
             fp=path.open("w")
             p=subprocess.Popen(["nsenter","-t",str(pid),"-n",sys.executable,str(TRAFFIC),
                                 "client","--proto",proto,"--family",family,
                                 "--port",str(port),"--seconds",str(seconds),
-                                "--mbit","3"],stdout=fp,stderr=subprocess.STDOUT)
+                                "--mbit",str(flow[2] if len(flow)>2 else 3)],stdout=fp,stderr=subprocess.STDOUT)
             workers.append((p,fp,path,"client"))
         for p,fp,path,role in workers:
             try:
@@ -89,7 +91,8 @@ def flow_batch(pid,root,label,flows,port,seconds):
                 raise RuntimeError(f"{label} {role} exited {p.returncode}: {path.read_text()[-2000:]}")
         sent=received=0
         flow_report=[]
-        for i,(proto,family) in enumerate(flows):
+        for i,flow in enumerate(flows):
+            proto,family=flow[:2]
             name=f"{label}_{i}_{proto}_{family}"
             server=parse_log(logs/(name+"_server.log"),"server")
             client=parse_log(logs/(name+"_client.log"),"client")
@@ -118,8 +121,8 @@ def flow_batch(pid,root,label,flows,port,seconds):
 def aggregate(mod,config,pid,root,label,seconds):
     for scenario,flows in (
         ("udp-ipv4-ipv6",[("udp","ipv4"),("udp","ipv6")]),
-        ("tcp-udp-ipv4",[("tcp","ipv4"),("udp","ipv4")]),
-        ("tcp-udp-ipv6",[("tcp","ipv6"),("udp","ipv6")]),
+        ("tcp-udp-ipv4",[("tcp","ipv4",3),("udp","ipv4",0.45)]),
+        ("tcp-udp-ipv6",[("tcp","ipv6",3),("udp","ipv6",0.45)]),
     ):
         # Assert the two protocols/families do not get TWO independent 1 Mbps
         # policers. Per-flow receive cannot be extrapolated to aggregation.
@@ -132,6 +135,15 @@ def aggregate(mod,config,pid,root,label,seconds):
         for flow in src["flows"]:
             if flow["delivered_mbps"]<=0:
                 raise RuntimeError(f"{label}/{scenario}: lost a required protocol/family: {src}")
+        if scenario.startswith("tcp-udp"):
+            tcp=next(x for x in src["flows"] if x["proto"]=="tcp")
+            if tcp["offered_mbps"] < 1.1 or tcp["delivered_mbps"] < .08:
+                raise RuntimeError(f"{label}/{scenario}: TCP underdriven/starved: {src}")
+    for fam in ("ipv4","ipv6"):
+        tcp_control=flow_batch(pid,root,f"{label}_tcp_control_{fam}",
+                               [("tcp",fam,3)],CONTROL,seconds)
+        if tcp_control["delivered_mbps"]<1.5:
+            raise RuntimeError(f"{label}: unpoliced TCP too slow ({fam}): {tcp_control}")
     # Without any rules on control port, prove that the test generator and
     # veth link can deliver substantially more than the configured 1 Mbps.
     control=flow_batch(pid,root,f"{label}_unpoliced_control",
