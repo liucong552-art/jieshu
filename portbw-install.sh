@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Managed portbw CPU candidate installer (UNVALIDATED ON VPS; DO NOT DEPLOY TO PRODUCTION).
+# Managed Helan test installer (fixed TCP burst, not yet host-upgrade validated).
 # Debian / Ubuntu + systemd; no dependency on VLESS, Xray, WireGuard or a specific VPS.
 set -Eeuo pipefail
 umask 077
@@ -13,7 +13,7 @@ CURRENT="$STATE/current.env"
 SOURCE="$HERE/portbw.py"
 PREVIOUS_SHA='69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359'
 PREVIOUS_CANDIDATE_SHA='601423e191fd809cda1bd7cbbab285096178b938a131ce4d9fe99fb83b08495f'
-EXPECTED_SHA='52eaa233f831236973dff6b43d8f320659b29226939ee5ba132d2b9cf31eebfb'
+EXPECTED_SHA='f0ebe551e8c0345c045a558b39a8b13523b2be8195255c67db13eec3eff5dc1a'
 V1_SHA='29676cc3e07c772cd617ed5e2888a80417144576fd279bc654297e5dcdcaa568'
 V2_SHA='96f3d4c5d0f24cec94a8555c0daec98b6b3ac8414457434ef9735eab540f3b23'
 UNITS=(portbw-restore.service portbw-watch.service portbw-watch.timer)
