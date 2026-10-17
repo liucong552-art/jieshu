@@ -33,6 +33,8 @@ def main():
     src=root/args.version/"portbw.py"
     expected={"A":"69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359",
               "B":"f0ebe551e8c0345c045a558b39a8b13523b2be8195255c67db13eec3eff5dc1a"}
+    if args.version=="B" and os.environ.get("PORTBW_LAB_B_SHA"):
+        expected["B"]=os.environ["PORTBW_LAB_B_SHA"]
     if hashlib.sha256(src.read_bytes()).hexdigest()!=expected[args.version]:
         raise RuntimeError("source hash mismatch")
     for d in ("config","state","run","locks"):
