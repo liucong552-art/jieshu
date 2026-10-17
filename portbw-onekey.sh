@@ -6,10 +6,10 @@ set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-REF=e93be192f008d0fe33dd88543cce2e84a30d6ac7
+REF=035c262ff1340aa028793f8d7f7a9b6ec5b990db
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
-EXPECTED_SHA=52eaa233f831236973dff6b43d8f320659b29226939ee5ba132d2b9cf31eebfb
-SCRIPT_VERSION=portbw-helan-cpu-candidate-20261017
+EXPECTED_SHA=f0ebe551e8c0345c045a558b39a8b13523b2be8195255c67db13eec3eff5dc1a
+SCRIPT_VERSION=portbw-helan-tcp-burst-fix-20261017
 fail(){ printf '拒绝继续：%s\n' "$*" >&2; exit 1; }
 
 [[ $(id -u) -eq 0 ]] || fail '请使用 root'
@@ -39,7 +39,7 @@ echo '候选版本源代码和安装器初步校验：通过'
 echo
 echo '请选择要在 Helan 执行的操作：'
 echo '  1) 只读预检查（不安装）'
-echo '  2) 全新安装优化版（修改 Helan systemd/nft/tc）'
+echo '  2) 快照恢复后全新安装 CPU+TCP 吞吐修复版（修改 Helan systemd/nft/tc）'
 echo '  3) 从已管理的旧版升级（先备份，修改 systemd/nft/tc）'
 echo '  4) 验证当前安装及 Watchdog'
 echo '  5) 回滚此安装器管理的优化版'
