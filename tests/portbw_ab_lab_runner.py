@@ -127,12 +127,28 @@ def set_up_link():
         # IPv6 availability is reported, not silently substituted for IPv4.
         ipv6 = False
         try:
-            execute("ip", "-6", "addr", "add", "2001:db8:4300::1/64", "dev", IFACE)
+            execute("ip", "-6", "addr", "add", "2001:db8:4300::1/64", "dev", IFACE, "nodad")
             execute("nsenter", "-t", str(child.pid), "-n", "ip", "-6", "addr",
-                    "add", "2001:db8:4300::2/64", "dev", PEER)
+                    "add", "2001:db8:4300::2/64", "dev", PEER, "nodad")
             ipv6 = True
         except subprocess.CalledProcessError:
             print("NOTE: IPv6 namespace addresses unavailable; IPv6 filter tests still required")
+        if ipv6:
+            # Query netlink in each namespace; the inherited sysfs mount can
+            # refer to host interfaces rather than the real net namespace.
+            for prefix, device, address in (
+                ([], IFACE, "2001:db8:4300::1"),
+                (["nsenter", "-t", str(child.pid), "-n"], PEER, "2001:db8:4300::2"),
+            ):
+                raw=execute(*(prefix+["ip","-j","-6","address","show","dev",device]),
+                            stdout=subprocess.PIPE).stdout
+                rows=json.loads(raw)
+                present=any(o.get("local")==address
+                            and "tentative" not in o.get("flags",[])
+                            and "dadfailed" not in o.get("flags",[])
+                            for row in rows for o in row.get("addr_info",[]))
+                if not present:
+                    raise RuntimeError(f"IPv6 {device} {address} not usable: {raw[:1000]}")
         return child, ipv6
     except Exception:
         child.terminate()
