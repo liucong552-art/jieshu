@@ -281,6 +281,7 @@ def main():
     arg.add_argument("--proto", choices=["udp","tcp"], default="udp")
     arg.add_argument("--family", choices=["ipv4","ipv6"], default="ipv4")
     arg.add_argument("--baseline-only", action="store_true", help="Measure untouched main only; do not run candidate")
+    arg.add_argument("--order", choices=["AB","BA"], default="AB")
     arg.add_argument("--profile-baseline", action="store_true", help="Extra A-only profiler pass; not used for CPU comparison")
     args = arg.parse_args()
     isolated()
@@ -331,7 +332,7 @@ def main():
             ports = prepare_ports(mod, config, count, args.auto)
             print(f"STAGE policy_count={count}, type={'auto+static' if args.auto else 'static'}",
                   flush=True)
-            order = ("A",) if args.baseline_only else ("A", "B")
+            order = ("A",) if args.baseline_only else tuple(args.order)
             for index, name in enumerate(order, 1):
                 reset_automatic(mod, config, args.auto)
                 audit_records(mod, config, ports)
@@ -356,7 +357,7 @@ def main():
                   "duration_each_seconds": args.seconds, "sizes": sizes,
                   "traffic": args.traffic, "transport":args.proto,"family":args.family,
                   "automatic_policy": args.auto,
-                  "baseline_only": args.baseline_only, "trials": trials}
+                  "baseline_only": args.baseline_only, "order":args.order, "trials": trials}
         path = root / "results/summary.json"
         path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print("LAB SUCCESS: results at "+str(path), flush=True)
