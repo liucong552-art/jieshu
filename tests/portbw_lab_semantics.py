@@ -118,6 +118,40 @@ def flow_batch(pid,root,label,flows,port,seconds):
             fp.close()
 
 
+def check_shared_cap(scenario, sample):
+    """Fail closed on bypass or traffic-generator starvation.
+
+    UDP socket writes reflect attempted demand; TCP socket accepted bytes
+    reflect BACKPRESSURE, not uncapped network demand. An actively policed
+    TCP connection need not report >=2.3 Mbps of accepted writes.
+    """
+    flows=sample["flows"]
+    delivered=sample["delivered_mbps"]
+    if not .70 < delivered < 1.35:
+        raise RuntimeError(f"{scenario}: aggregate throughput not near the shared 1 Mbps cap: {sample}")
+    if scenario=="udp-ipv4-ipv6":
+        if sample["offered_mbps"]<2.3 or len(flows)!=2 or not all(
+                x["proto"]=="udp" and x["offered_mbps"]>1.0
+                and x["delivered_mbps"]>.1 for x in flows):
+            raise RuntimeError(f"{scenario}: UDP/dual-stack overload or participation unproven: {sample}")
+    elif scenario.startswith("tcp-udp"):
+        tcp=[x for x in flows if x["proto"]=="tcp"]
+        udp=[x for x in flows if x["proto"]=="udp"]
+        if len(tcp)!=1 or len(udp)!=1:
+            raise RuntimeError(f"{scenario}: expected one TCP and one UDP flow: {sample}")
+        # Require both transports to carry SIGNIFICANT real traffic. This
+        # rejects the earlier ~0.009 Mbps TCP pseudo-competition but accepts
+        # a normal .546 TCP + .450 UDP split under 1 Mbps policing.
+        if not (tcp[0]["offered_mbps"]>=.35
+                and tcp[0]["delivered_mbps"]>=.2
+                and udp[0]["offered_mbps"]>=.4
+                and udp[0]["delivered_mbps"]>=.2
+                and sample["offered_mbps"]>=1.1):
+            raise RuntimeError(f"{scenario}: TCP or UDP is underdriven/starved: {sample}")
+    else:
+        raise RuntimeError(f"unknown aggregate scenario {scenario}")
+
+
 def aggregate(mod,config,pid,root,label,seconds):
     for scenario,flows in (
         ("udp-ipv4-ipv6",[("udp","ipv4"),("udp","ipv6")]),
@@ -128,17 +162,7 @@ def aggregate(mod,config,pid,root,label,seconds):
         # policers. Per-flow receive cannot be extrapolated to aggregation.
         mod.reconcile(config,monitor=False)
         src=flow_batch(pid,root,f"{label}_{scenario}",flows,PORT,seconds)
-        if src["offered_mbps"]<2.3:
-            raise RuntimeError(f"{label}/{scenario}: inadequate combined offered load: {src}")
-        if not .05 < src["delivered_mbps"] < 1.35:
-            raise RuntimeError(f"{label}/{scenario}: NOT a shared 1 Mbps cap: {src}")
-        for flow in src["flows"]:
-            if flow["delivered_mbps"]<=0:
-                raise RuntimeError(f"{label}/{scenario}: lost a required protocol/family: {src}")
-        if scenario.startswith("tcp-udp"):
-            tcp=next(x for x in src["flows"] if x["proto"]=="tcp")
-            if tcp["offered_mbps"] < 1.1 or tcp["delivered_mbps"] < .08:
-                raise RuntimeError(f"{label}/{scenario}: TCP underdriven/starved: {src}")
+        check_shared_cap(scenario,src)
     for fam in ("ipv4","ipv6"):
         tcp_control=flow_batch(pid,root,f"{label}_tcp_control_{fam}",
                                [("tcp",fam,3)],CONTROL,seconds)
