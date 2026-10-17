@@ -7,8 +7,8 @@ for c in curl python3 sha256sum unshare nsenter ip nft tc; do command -v "$c" >/
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
 BRANCH=opt/portbw-cpu-snapshot-index-20261016
 # Immutable commit containing the corrected TCP backpressure checks.
-HARNESS_REF=a0a7e45af9b27930ea67fed3e969990ce360f0c1
-HARNESS_VERSION=20261017-tcp-acceptance-v2
+HARNESS_REF=f62af2523782b259cb255e7471ebdcaf253aac22
+HARNESS_VERSION=20261017-shared-police-pressure-v3
 ROOT=$(mktemp -d /tmp/portbw-cpu-XXXXXXXX)
 mkdir -p "$ROOT"/{A,B,tools,results}
 echo "TEST_ROOT=$ROOT"
@@ -28,7 +28,11 @@ grep -Fq 'def check_shared_cap(scenario, sample):' "$ROOT/tools/portbw_lab_seman
 if grep -Fq 'if src["offered_mbps"]<2.3:' "$ROOT/tools/portbw_lab_semantics.py"; then
   echo 'ERROR: obsolete TCP=UDP overload threshold detected; STOP' >&2; exit 1
 fi
+grep -Fq 'def police_stats(mod, direction="up"):' "$ROOT/tools/portbw_lab_semantics.py" || {
+  echo 'ERROR: missing required tc police counter validation' >&2; exit 1
+}
 echo 'HARNESS_GATE=CORRECTED_TCP_BACKPRESSURE'
+echo 'HARNESS_GATE=ACTUAL_TC_POLICE_COUNTERS'
 python3 -m py_compile "$ROOT"/tools/*.py "$ROOT/A/portbw.py" "$ROOT/B/portbw.py"
 export PORTBW_LAB_ACK=isolated-netns-only
 case "${SEMANTIC_SUITES:-all}" in
