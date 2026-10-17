@@ -17,19 +17,24 @@ def sample(tcp_off=.712,tcp_rx=.546,udp_off=.45,udp_rx=.45):
 
 class AcceptanceTests(unittest.TestCase):
     def test_measured_helan_tcp_udp_is_accepted(self):
-        sem.check_shared_cap("tcp-udp-ipv4",sample())
+        sem.check_shared_cap("tcp-udp-ipv4",sample(),{"drops":100,"overlimits":100})
     def test_tcp_starvation_is_rejected(self):
         with self.assertRaises(RuntimeError):
-            sem.check_shared_cap("tcp-udp-ipv4",sample(.04,.009,3,.996))
+            sem.check_shared_cap("tcp-udp-ipv4",sample(.04,.009,3,.996),{"drops":100,"overlimits":100})
     def test_shared_cap_bypass_is_rejected(self):
         with self.assertRaises(RuntimeError):
-            sem.check_shared_cap("tcp-udp-ipv4",sample(3,1.1,.45,.45))
+            sem.check_shared_cap("tcp-udp-ipv4",sample(3,1.1,.45,.45),{"drops":100,"overlimits":100})
     def test_udp_underload_is_rejected(self):
         x={"offered_mbps":1.0,"delivered_mbps":.98,"flows":[
            {"proto":"udp","offered_mbps":.5,"delivered_mbps":.49},
            {"proto":"udp","offered_mbps":.5,"delivered_mbps":.49}]}
         with self.assertRaises(RuntimeError):
-            sem.check_shared_cap("udp-ipv4-ipv6",x)
+            sem.check_shared_cap("udp-ipv4-ipv6",x,{"drops":100,"overlimits":100})
+    def test_helan_ipv6_tcp_backpressure(self):
+        sem.check_shared_cap("tcp-udp-ipv6",sample(.544,.473,.45,.45),{"drops":100,"overlimits":100})
+    def test_missing_kernel_pressure_must_fail(self):
+        with self.assertRaises(RuntimeError):
+            sem.check_shared_cap("tcp-udp-ipv4",sample(),{"drops":0,"overlimits":0})
     def test_dual_stack_udp_under_cap(self):
         x={"offered_mbps":6,"delivered_mbps":.998,"flows":[
            {"proto":"udp","offered_mbps":3,"delivered_mbps":.572},
