@@ -16,7 +16,7 @@ echo "HARNESS_VERSION=$HARNESS_VERSION"
 echo "HARNESS_REF=$HARNESS_REF"
 curl -fsSL --retry 3 "$BASE/main/portbw.py" -o "$ROOT/A/portbw.py"
 curl -fsSL --retry 3 "$BASE/$HARNESS_REF/portbw.py" -o "$ROOT/B/portbw.py"
-for f in portbw_ab_lab_runner.py portbw_lab_traffic.py portbw_lab_semantics.py portbw_lab_semantic_runner.py verify_portbw_semantic_harness.py; do
+for f in portbw_ab_lab_runner.py portbw_lab_traffic.py portbw_lab_semantics.py portbw_lab_semantic_runner.py portbw_lab_outbound_traffic.py verify_portbw_semantic_harness.py; do
   curl -fsSL --retry 3 "$BASE/$HARNESS_REF/tests/$f" -o "$ROOT/tools/$f"
 done
 printf "%s  %s\n" "69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359" "$ROOT/A/portbw.py" "52eaa233f831236973dff6b43d8f320659b29226939ee5ba132d2b9cf31eebfb" "$ROOT/B/portbw.py" | sha256sum -c -
@@ -26,11 +26,12 @@ python3 -B "$ROOT/tools/verify_portbw_semantic_harness.py" "$ROOT/tools/portbw_l
 python3 -m py_compile "$ROOT"/tools/*.py "$ROOT/A/portbw.py" "$ROOT/B/portbw.py"
 export PORTBW_LAB_ACK=isolated-netns-only
 case "${SEMANTIC_SUITES:-all}" in
-  all) SUITES=(aggregate faults lifecycle) ;;
+  all) SUITES=(aggregate outbound faults lifecycle) ;;
   aggregate) SUITES=(aggregate) ;;
   faults) SUITES=(faults) ;;
+  outbound) SUITES=(outbound) ;;
   lifecycle) SUITES=(lifecycle) ;;
-  *) echo 'Invalid SEMANTIC_SUITES (all|aggregate|faults|lifecycle)' >&2; exit 1 ;;
+  *) echo 'Invalid SEMANTIC_SUITES (all|aggregate|outbound|faults|lifecycle)' >&2; exit 1 ;;
 esac
 for suite in "${SUITES[@]}"; do
   for version in A B; do
