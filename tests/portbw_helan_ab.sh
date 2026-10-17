@@ -26,14 +26,14 @@ echo "===== ORIGINAL MAIN BASELINE FIRST ====="
 EXTRA=()
 if [[ "${TEST_AUTO:-0}" == 1 ]]; then EXTRA+=(--auto); fi
 echo "Phase A1: untouched main, rule counts and real command CPU."
-unshare --net -- python3 -B "$ROOT/tools/portbw_ab_lab_runner.py" --root "$ROOT" --seconds "${TEST_SECONDS:-30}" --sizes "${TEST_SIZES:-1,10}" --traffic "${TEST_TRAFFIC:-idle}" --baseline-only --profile-baseline "${EXTRA[@]}" 2>&1 | tee "$ROOT/results/baseline.log"
+unshare --net -- python3 -B "$ROOT/tools/portbw_ab_lab_runner.py" --root "$ROOT" --seconds "${TEST_SECONDS:-30}" --sizes "${TEST_SIZES:-1,10}" --traffic "${TEST_TRAFFIC:-idle}" --proto "${TEST_PROTO:-udp}" --family "${TEST_FAMILY:-ipv4}" --baseline-only --profile-baseline "${EXTRA[@]}" 2>&1 | tee "$ROOT/results/baseline.log"
 cp "$ROOT/results/summary.json" "$ROOT/results/baseline-summary.json"
 echo "===== BASELINE CPU RESULTS ====="
 cat "$ROOT/results/baseline-summary.json"
 echo "Python hot paths reports: $ROOT/results/"*"_A_hotspots.pstats.txt"
 if [[ "${RUN_AB_AFTER_BASELINE:-0}" == 1 ]]; then
   echo "Phase A2: same environment sequential A/B."
-  unshare --net -- python3 -B "$ROOT/tools/portbw_ab_lab_runner.py" --root "$ROOT" --seconds "${TEST_SECONDS:-30}" --sizes "${TEST_SIZES:-1,10}" --traffic "${TEST_TRAFFIC:-idle}" "${EXTRA[@]}" 2>&1 | tee "$ROOT/results/ab.log"
+  unshare --net -- python3 -B "$ROOT/tools/portbw_ab_lab_runner.py" --root "$ROOT" --seconds "${TEST_SECONDS:-30}" --sizes "${TEST_SIZES:-1,10}" --traffic "${TEST_TRAFFIC:-idle}" --proto "${TEST_PROTO:-udp}" --family "${TEST_FAMILY:-ipv4}" "${EXTRA[@]}" 2>&1 | tee "$ROOT/results/ab.log"
   cp "$ROOT/results/summary.json" "$ROOT/results/ab-summary.json"
 fi
 echo "===== SUMMARY ====="
