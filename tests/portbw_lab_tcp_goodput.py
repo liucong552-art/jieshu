@@ -95,6 +95,28 @@ def sender(args):
     },sort_keys=True),flush=True)
 
 
+def tc_mode(args):
+    return args.mode!="nft_only"
+
+
+def remove_lab_nft_drop(mod):
+    """Isolation-only tc control: remove exact port's nft DROP.
+
+    The surrounding bench has refused the initial host netns and verified
+    the private veth-only interfaces. Never execute on a host namespace.
+    """
+    matches=[row["rule"] for row in mod.nft_snapshot()
+             if "rule" in row and row["rule"].get("comment")==mod.comment("up",PORT,"drop")]
+    if len(matches)!=1:
+        raise RuntimeError("tc_only: owned nft drop rule not unique")
+    rule=matches[0]
+    if rule.get("family")!="inet" or rule.get("table")!=mod.TABLE or rule.get("chain")!="inbound":
+        raise RuntimeError("tc_only: unexpected nft drop rule location")
+    subprocess.run(["nft","delete","rule","inet",mod.TABLE,"inbound",
+                    "handle",str(rule["handle"])],
+                   check=True,text=True,capture_output=True)
+
+
 def police(mod):
     body=mod.tc_action_block(mod.tc_police_index(PORT,"up"))
     if not body:raise RuntimeError("shared up police action missing")
@@ -108,7 +130,7 @@ def run_once(args,child,mod,root,tag,port):
     results.mkdir(parents=True,exist_ok=True)
     rpath=results/f"{args.version}_{args.mode}_{tag}_receiver.log"
     spath=results/f"{args.version}_{args.mode}_{tag}_sender.log"
-    before=police(mod) if args.mode=="both" else None
+    before=police(mod) if tc_mode(args) else None
     env={**os.environ,"PORTBW_LAB_ACK":"isolated-netns-only"}
     receiver_cmd=[sys.executable,"-B",str(Path(__file__).resolve()),"receiver",
                   "--port",str(port),"--seconds",str(args.seconds),
@@ -132,7 +154,7 @@ def run_once(args,child,mod,root,tag,port):
             raise RuntimeError(f"TCP test failed {tag}: {rpath.read_text()[-800:]} {spath.read_text()[-800:]}")
         text=rpath.read_text().splitlines()
         obj=json.loads(next(x.split("GOODPUT_RECEIVER=",1)[1] for x in text if x.startswith("GOODPUT_RECEIVER=")))
-        if args.mode=="both":
+        if tc_mode(args):
             after=police(mod)
             delta={k:after[k]-before[k] for k in before}
             if any(x<0 for x in delta.values()):
@@ -174,9 +196,14 @@ def bench(args):
                           PORTBW_LOCK=base+"/locks_"+scope+"/manager.lock",
                           PORTBW_RUN=base+"/run_"+scope,PORTBW_UNITS=base+"/units_"+scope)
         mod=runner.module(src)
-        cfg={"iface":runner.IFACE,"tc_enabled":args.mode=="both","version":2}
+        if args.mode in ("tc_burst_1m","tc_burst_4m"):
+            # Test-only burst override. BOTH drop layers remain installed.
+            # No production module or host network configuration is changed.
+            kb={"tc_burst_1m":1024,"tc_burst_4m":4096}[args.mode]
+            mod.tc_burst_kb=lambda rate:kb
+        cfg={"iface":runner.IFACE,"tc_enabled":tc_mode(args),"version":2}
         mod.write_json(mod.CONF/"config.json",cfg)
-        if args.mode=="both":
+        if tc_mode(args):
             mod.tc_prepare(runner.IFACE)
             runner.prepare_ports(mod,cfg,1,False)
         else:
@@ -201,6 +228,8 @@ def bench(args):
                 mbps=int(tag)
                 mod.commit(PORT,125000*mbps,125000*40 if args.mode=="both" else 0,cfg)
                 runner.audit_records(mod,cfg,[PORT])
+                if args.mode=="tc_only":
+                    remove_lab_nft_drop(mod)
             results.append(run_once(args,child,mod,root,tag,port))
         summary={r["scenario"]:r["receive"]["steady_mbps"] for r in results}
         print("TCP_GOODPUT_SUMMARY="+json.dumps({"version":args.version,
@@ -208,7 +237,13 @@ def bench(args):
              "steady_mbps":summary},sort_keys=True),flush=True)
         path=root/"results"/f"goodput_{args.version}_{args.mode}.json"
         path.write_text(json.dumps(results,indent=2)+"\n",encoding="utf-8")
-        runner.audit_records(mod,cfg,[PORT])
+        if args.mode!="tc_only":
+            runner.audit_records(mod,cfg,[PORT])
+        else:
+            # Intentionally damaged nft DROP in isolated lab; normal audit
+            # MUST fail rather than mistake tc-only for a valid deployed rule.
+            if mod.nft_ok(PORT,mod.read_json(mod.port_file(PORT))):
+                raise RuntimeError("tc_only incorrectly audited healthy")
     finally:
         if child:
             child.terminate()
@@ -221,7 +256,7 @@ def main():
     ap.add_argument("role",choices=("bench","sender","receiver"))
     ap.add_argument("--root")
     ap.add_argument("--version",choices=("A","B"),default="B")
-    ap.add_argument("--mode",choices=("both","nft_only"),default="both")
+    ap.add_argument("--mode",choices=("both","nft_only","tc_only","tc_burst_1m","tc_burst_4m"),default="both")
     ap.add_argument("--port",type=int,choices=(PORT,CONTROL),default=PORT)
     ap.add_argument("--seconds",type=int,default=24)
     ap.add_argument("--warmup",type=int,default=4)
