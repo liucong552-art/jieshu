@@ -39,7 +39,7 @@ class AcceptanceTests(unittest.TestCase):
         x={"offered_mbps":6,"delivered_mbps":.998,"flows":[
            {"proto":"udp","offered_mbps":3,"delivered_mbps":.572},
            {"proto":"udp","offered_mbps":3,"delivered_mbps":.426}]}
-        sem.check_shared_cap("udp-ipv4-ipv6",x)
+        sem.check_shared_cap("udp-ipv4-ipv6",x,{"drops":100,"overlimits":100})
 
 if __name__=="__main__":
     unittest.main()
