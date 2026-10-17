@@ -115,28 +115,34 @@ def run_tcp(role, port, seconds, mbit, family, addresses):
         return
 
     sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.settimeout(12)
     sock.connect((addresses[0], port))
     sock.setblocking(False)
     started = time.monotonic()
     end = started + seconds
     next_send = started
-    interval = len(PAYLOAD) * 8 / (mbit * 1000000)
+    # The previous client sent only 1200 bytes and then potentially slept
+    # 20 ms when not yet due, limiting its own offered load and making an
+    # apparent TCP/UDP shared-cap test almost all UDP. A larger TCP chunk
+    # combined with a deadline-based wait permits an honest 3 Mbps source.
+    chunk = bytes(4096)
     sent = received = errors = 0
     try:
         while time.monotonic() < end:
             now = time.monotonic()
-            writable = now >= next_send
+            want_write = now >= next_send
+            timeout = 0 if want_write else min(.005, max(0, next_send - now))
             readable, can_write, _ = select.select(
-                [sock], [sock] if writable else [], [], .02)
+                [sock], [sock] if want_write else [], [], timeout)
             if can_write:
                 try:
-                    n = sock.send(PAYLOAD)
+                    n = sock.send(chunk)
                     if n:
                         sent += n
-                    next_send += interval
-                    if next_send < now - interval * 3:
-                        next_send = now
+                        next_send += n * 8 / (mbit * 1000000)
+                        if next_send < now - .05:
+                            next_send = now
                 except BlockingIOError:
                     pass
                 except (ConnectionResetError, BrokenPipeError):
@@ -154,7 +160,6 @@ def run_tcp(role, port, seconds, mbit, family, addresses):
         sock.close()
         emit({"role": "client", "proto": "tcp", "tx_bytes": sent,
               "rx_bytes": received, "send_errors": errors, "seconds": seconds})
-
 
 def main():
     p = argparse.ArgumentParser()
