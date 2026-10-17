@@ -20,7 +20,7 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument("--root",required=True)
     p.add_argument("--version",choices=["A","B"],required=True)
-    p.add_argument("--suite",choices=["aggregate","faults","lifecycle"],required=True)
+    p.add_argument("--suite",choices=["aggregate","faults","lifecycle","outbound"],required=True)
     p.add_argument("--seconds",type=int,default=18)
     args=p.parse_args()
     if not 12<=args.seconds<=120:
@@ -62,6 +62,8 @@ def main():
             sem.aggregate(mod,cfg,child.pid,root,args.version,args.seconds)
         elif args.suite=="faults":
             sem.faults(mod,cfg,args.version)
+        elif args.suite=="outbound":
+            sem.outbound(mod,cfg,child.pid,root,args.version,args.seconds)
         else:
             sem.lifecycle(mod,cfg,child.pid,root,args.version)
         sem.audit(mod,cfg)
