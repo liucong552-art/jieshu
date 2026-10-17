@@ -27,6 +27,7 @@ on:
       - 'tests/portbw_helan_burst_semantic.sh'
       - 'tests/portbw_helan_live_path_diagnose.py'
       - 'tests/portbw_lab_egress_tcp_goodput.py'
+      - 'tests/test_portbw_egress_lab_paths.py'
       - 'tests/portbw_helan_egress_tcp_goodput.sh'
       - 'tests/portbw_helan_burst_semantic.sh'
       - '.github/workflows/portbw-candidate.yml'
@@ -50,6 +51,7 @@ jobs:
           bash -n tests/portbw_helan_tcp_goodput.sh
           bash -n tests/portbw_helan_burst_fix.sh
           python3 -m py_compile tests/portbw_lab_egress_tcp_goodput.py
+          python3 -m unittest discover -s tests -p 'test_portbw_egress_lab_paths.py' -v
           bash -n tests/portbw_helan_egress_tcp_goodput.sh
           bash -n tests/portbw_helan_burst_semantic.sh
           bash -n tests/portbw_helan_burst_semantic.sh
