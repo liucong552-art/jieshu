@@ -64,6 +64,9 @@ def preflight(a):
     if hostname!=a.host:raise Refuse(f"wrong host {hostname}; expected {a.host}")
     if sha(PROG)!=OLD_SHA:raise Refuse(f"legacy binary hash mismatch: {sha(PROG)}")
     if not CLI.is_file() or CLI.is_symlink():raise Refuse("old portbw CLI wrapper not found")
+    wrapper=CLI.read_text()
+    if "/usr/local/lib/portbw/portbw.py" not in wrapper or "python" not in wrapper:
+        raise Refuse("legacy CLI wrapper is not the expected Python entry")
     if MARK.exists() or MARK.is_symlink():raise Refuse("managed marker already exists")
     cfg=json.loads(CONFIG.read_text())
     if cfg.get("tc_enabled") is not True:raise Refuse("only old nft+tc mode supported")
@@ -205,7 +208,11 @@ def rollback(directory,*,automatic=False):
     if sha(original)!=OLD_SHA:raise Refuse("backup original source hash mismatch")
     for u in ("portbw-watch.timer","portbw-watch.service","portbw-restore.service"):
         run("systemctl","stop",u,check=False)
-    run("systemctl","disable","portbw-watch.timer","portbw-restore.service",check=False)
+    # Do not leave the new resident Watchdog enabled across legacy rollback.
+    # Old installs use the timer, and cannot coexist with a resident daemon.
+    run("systemctl","disable","portbw-watch.service",check=False)
+    run("systemctl","disable","portbw-watch.timer",check=False)
+    run("systemctl","disable","portbw-restore.service",check=False)
     remove_current_rules_if_new()
     # Restore saved legacy program, wrapper, configuration, policy state and units.
     for original_path in PATHS:
@@ -230,6 +237,7 @@ def rollback(directory,*,automatic=False):
 
 def migrate(a):
     cfg,policies=preflight(a)
+    old=load_module()
     work=Path(tempfile.mkdtemp(prefix="portbw-migrate-package-"))
     package=fetch_package(work)
     backup=take_backup(cfg,policies)
@@ -240,6 +248,13 @@ def migrate(a):
         for port in sorted(policies):
             print(run(CLI,"del",str(port)),flush=True)
         if list(POLICIES.glob("*.json")):raise Refuse("legacy port records remain")
+        # Old shared policers/flower filters must be gone, not merely the
+        # persistent JSON records. Never remove foreign clsact/qdisc rules.
+        for port,rec in policies.items():
+            zero={"up":0,"down":0}
+            if "tc_prefs" in rec:zero["tc_prefs"]=rec["tc_prefs"]
+            if not old.tc_ok(port,zero,cfg["iface"]):
+                raise Refuse(f"{port}: old owned tc filters/action still attached")
         remove_empty_owned_nft()
         remove_unit_files()
         print(run("bash",package["portbw-install.sh"],"check","--iface",cfg["iface"]),flush=True)
