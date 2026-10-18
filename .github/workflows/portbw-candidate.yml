@@ -2,7 +2,7 @@ name: portbw candidate regression (feature branch only)
 on:
   push:
     branches:
-      - fix/portbw-auto-sustained-window-20261018
+      - release/portbw-helan-dual-auto-20261018
     paths:
       - 'portbw.py'
       - 'portbw-install.sh'
@@ -90,14 +90,15 @@ jobs:
             echo 'DANGER: semantics runner ran in host namespace'; exit 1
           fi
           grep -q 'runner.isolated()' tests/portbw_lab_semantic_runner.py
-      - name: Reject unvalidated host installer for bidirectional candidate
+      - name: Validate Helan release pinned hash and upgrade gate
         run: |
           actual="$(sha256sum portbw.py | awk '{print $1}')"
-          expected="$(sed -n "s/^EXPECTED_SHA='\\([a-f0-9]*\\)'$/\\1/p" portbw-install.sh)"
-          test -n "$expected"
-          test "$actual" != "$expected"
-          echo 'Candidate installer intentionally pinned to old passed host build.'
+          grep -Fq "EXPECTED_SHA='$actual'" portbw-install.sh
+          grep -Fq "EXPECTED_SHA=$actual" portbw-onekey.sh
+          grep -q 'preflight_upgrade(){' portbw-install.sh
+          grep -Fq 'CURRENT_HELAN_SHA=' portbw-install.sh
+          grep -q 'preflight-upgrade' portbw-onekey.sh
       - name: Guard production branch and production mode
         run: |
-          test "${GITHUB_REF_NAME}" = "fix/portbw-auto-sustained-window-20261018"
+          test "${GITHUB_REF_NAME}" = "release/portbw-helan-dual-auto-20261018"
           grep -q 'check_isolation()' tests/portbw_cpu_probe.py
