@@ -22,7 +22,7 @@ CONTROL=43080
 SENDER_ADDR="198.18.0.2"
 SERVER_ADDR="198.18.0.1"
 A_SHA="69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359"
-B_SHA="52eaa233f831236973dff6b43d8f320659b29226939ee5ba132d2b9cf31eebfb"
+B_SHA="a6f5232edede0fd8c2114589b4de18d7ee2c6745af9aa860682996ad16a262c9"
 CHUNK=b"t"*16384
 
 
@@ -221,7 +221,7 @@ def bench(args):
                  "dev",runner.PEER,"root","netem",
                  "delay",str(args.delay_ms)+"ms"]
             subprocess.run(cmd,check=True,text=True,capture_output=True)
-        experiments=[("control",CONTROL),("40",PORT),("20",PORT)]
+        experiments=([("control",CONTROL)] if not args.skip_control else [])+[("40",PORT),("20",PORT)]
         results=[]
         for tag,port in experiments:
             if port==PORT:
@@ -255,6 +255,7 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("role",choices=("bench","sender","receiver"))
     ap.add_argument("--root")
+    ap.add_argument("--skip-control",action="store_true")
     ap.add_argument("--version",choices=("A","B"),default="B")
     ap.add_argument("--mode",choices=("both","nft_only","tc_only","tc_burst_1m","tc_burst_4m"),default="both")
     ap.add_argument("--port",type=int,choices=(PORT,CONTROL),default=PORT)
