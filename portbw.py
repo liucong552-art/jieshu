@@ -219,6 +219,10 @@ add chain inet {TABLE} outbound {{ type filter hook output priority -5; policy a
     else:
         chains=_check_owned_table(items,allow_missing=True)
         missing=set(CHAIN.values())-set(chains)
+        if not missing:
+            # This exact snapshot has already passed every global ownership and
+            # chain check; a second nft dump cannot strengthen that validation.
+            return items
         if missing:
             # Repair only genuinely missing owned chains. Never flush or replace others.
             script=''.join(f'add chain inet {TABLE} {name} {{ type filter hook '
@@ -307,13 +311,44 @@ def _rule_exact(rule,port,d,kind):
         return d=='up' and _named_ref(expr[2],'limit')==limitname(d,port) and expr[3]=={'drop':None}
     return _named_ref(expr[2],'counter')==countname(d,port)
 
-def nft_ok(port,rec,items=None):
+def _nft_watch_index(items):
+    """Index ONE already validated nft snapshot, preserving duplicate entries."""
+    rules={};objects={};limits={};order={};generation={}
+    for pos,row in enumerate(items):
+        r=row.get('rule')
+        if r:
+            c=str(r.get('comment',''))
+            match=OWNED_RULE_RE.fullmatch(c)
+            if match:
+                port=int(match[1]);direction=match[2]
+                rules.setdefault(port,[]).append(r)
+                generation.setdefault((port,direction),[]).append(r['handle'])
+                order[c]=pos  # Same last-occurrence semantics as original comprehension.
+        for kind in ('limit','counter'):
+            obj=row.get(kind)
+            if obj:
+                name=obj.get('name','')
+                port=int(name.rsplit('_',1)[-1])
+                objects.setdefault(port,[]).append((kind,name))
+                if kind=='limit':limits.setdefault(name,[]).append(obj)
+    for handles in generation.values():handles.sort()
+    return {'rules':rules,'objects':objects,'limits':limits,
+            'order':order,'generation':generation}
+
+
+def nft_ok(port,rec,items=None,*,validated=False,index=None):
     try:
         if items is None:items=nft_snapshot()
-        validate_base(items)  # Includes isolation: no foreign rule in our chains.
-        rules,objects=owned(items,port)
+        if not validated:
+            validate_base(items)  # Includes isolation: no foreign rule in our chains.
+        if index is None:
+            rules,objects=owned(items,port)
+            rows=[x['rule'] for x in items if 'rule' in x and str(x['rule'].get('comment','')).startswith(f'pbw-{port}-')]
+        else:
+            rows=index['rules'].get(port,[])
+            rules=[(r['chain'],r['handle']) for r in rows]
+            objects=index['objects'].get(port,[])
         desired=expected_comments(port,rec)
-        rows=[x['rule'] for x in items if 'rule' in x and str(x['rule'].get('comment','')).startswith(f'pbw-{port}-')]
         if {x['comment'] for x in rows}!=desired or len(rows)!=len(desired):return False
         # Inbound: nft and tc can both police. Outbound: nft OUTPUT drops
         # return EPERM to local UDP sendmsg(), aborting apps such as iperf3.
@@ -325,7 +360,8 @@ def nft_ok(port,rec,items=None):
         for d in CHAIN:
             if not rec[d]:continue
             if d=='up':
-                lims=[x['limit'] for x in items if 'limit' in x and x['limit'].get('name')==limitname(d,port)]
+                lims=([x['limit'] for x in items if 'limit' in x and x['limit'].get('name')==limitname(d,port)]
+                      if index is None else index['limits'].get(limitname(d,port),[]))
                 if len(lims)!=1:return False
                 lim=lims[0]
                 if _limit_rate(lim)!=rec[d] or lim.get('per','second')!='second' \
@@ -335,7 +371,8 @@ def nft_ok(port,rec,items=None):
                 selected=[r for r in rows if r['comment']==comment(d,port,kind)]
                 if len(selected)!=1 or not _rule_exact(selected[0],port,d,kind):return False
             # DROP must precede named counter, and no earlier accept/bypass exists.
-            order={r['comment']:i for i,x in enumerate(items) if (r:=x.get('rule'))}
+            order=({r['comment']:i for i,x in enumerate(items) if (r:=x.get('rule'))}
+                   if index is None else index['order'])
             if d=='up' and order[comment(d,port,'drop')]>=order[comment(d,port,'count')]:return False
         return True
     except (Error,ValueError,TypeError,KeyError,StopIteration):return False
@@ -554,17 +591,50 @@ def _quantity_bytes(number,unit):
             'ki':1024,'mi':1024**2,'gi':1024**3}
     return Decimal(number)*factor[unit.lower()]
 
-def tc_burst_kb(rate):
-    return max(64,min(1024,(rate//10+1023)//1024))
+def tc_burst_kb(rate,direction='down'):
+    # Ingress policing with a small (0.1s) bucket severely underdelivers
+    # TCP goodput on GSO/TSO traffic: on Helan 20 Mbps -> ~9.4 Mbps.
+    # Isolated kernel trials showed 1 MiB restores ~20 Mbps while retaining
+    # both nft DROP and a single shared tc action across TCP/UDP and v4/v6.
+    # Permit at most ~0.5s of tokens, capped at 1 MiB. Keep the existing
+    # egress now uses the same capped half-second allowance after testing.
+    if direction=='up':
+        return max(64,min(1024,(rate+2047)//2048))
+    if direction=='down':
+        # Real TCP receiver-goodput on Helan with the old 0.1s egress
+        # bucket was 0.315/7.586/17.645 Mbps under 5/20/40 Mbps caps.
+        # Half-second bounded burst gave 4.811/19.138/37.482 Mbps.
+        # Keep the configured sustained rate; allow bounded packet trains.
+        return max(64,min(1024,(rate+2047)//2048))
+    raise Error('未知 tc 限速方向')
 
 def _tc_filter_body(text,port,direction,family,transport,pref):
     protocol=tc_protocol(family)
     head=re.compile(r'^filter protocol '+re.escape(protocol)+r' pref '+str(pref)+
                     r' flower chain 0 handle (?:0x)?'+format(tc_handle(port),'x')+r'\b',re.M)
+    if isinstance(text,dict):
+        # Only complete filter blocks from this SAME snapshot; match with the
+        # original strict expression, including the exact owned handle.
+        for block in text.get((protocol,pref),()):
+            m=head.search(block)
+            if m:return block[m.end():]
+        return None
     m=head.search(text)
     if not m:return None
     next_filter=re.search(r'^filter protocol ',text[m.end():],re.M)
     return text[m.end():m.end()+next_filter.start() if next_filter else len(text)]
+
+
+def _tc_text_index(text):
+    """Split tc -s filter dump once; keep every candidate, including duplicates."""
+    matches=list(re.finditer(r'^filter protocol ',text,re.M))
+    blocks={}
+    for i,m in enumerate(matches):
+        block=text[m.start():matches[i+1].start() if i+1<len(matches) else len(text)]
+        header=re.match(r'^filter protocol (\S+) pref ([0-9]+) ',block)
+        if header:
+            blocks.setdefault((header[1],int(header[2])),[]).append(block)
+    return blocks
 
 def tc_rate_is_ok(entry,b,iface,direction,port,family,transport,rec,text=None,check_rate=True):
     if not entry:return False
@@ -596,7 +666,7 @@ def tc_rate_is_ok(entry,b,iface,direction,port,family,transport,rec,text=None,ch
         bm=re.search(r'\bburst\s+([0-9]+(?:\.[0-9]+)?)([kKmMgG]?)b\b',line)
         if not bm:return False
         actual_burst=_quantity_bytes(bm.group(1),bm.group(2))
-        desired_burst=Decimal(tc_burst_kb(b)*1024)
+        desired_burst=Decimal(tc_burst_kb(b,direction)*1024)
         if check_rate and abs(actual_burst-desired_burst)>max(Decimal(256),desired_burst*Decimal('0.05')):return False
         if not re.search(r'\baction drop(?:/ok)?(?:\s|$)',line):return False
         return True
@@ -649,7 +719,7 @@ def apply_tc(port,rec,iface):
                            for _,_,f,t,_,old in theirs)):
                 raise Error(f'{port}: {direction} action 归属/绑定异常，拒绝原位改速')
             run(['tc','actions','replace','action','police','rate',f'{rec[direction]*8}bit',
-                 'burst',f'{tc_burst_kb(rec[direction])}k','conform-exceed','drop/ok',
+                 'burst',f'{tc_burst_kb(rec[direction],direction)}k','conform-exceed','drop/ok',
                  'index',str(index),'skip_hw'])
             continue
         if not existing and tc_action_exists(index):
@@ -669,7 +739,7 @@ def apply_tc(port,rec,iface):
         if existing:
             tc_gc_unbound_police(port,index)
         if rec[direction]==0:continue
-        kb=tc_burst_kb(rec[direction])
+        kb=tc_burst_kb(rec[direction],direction)
         for n,(_,_,family,transport,pref,_) in enumerate(theirs):
             field='dst_port' if direction=='up' else 'src_port'
             cmd=['tc','filter','add','dev',iface,tcdir,'protocol',tc_protocol(family),
@@ -731,13 +801,24 @@ def tc_gc_unbound_police(port,index):
         time.sleep(0.25)
 
 
+def _tc_pref_groups(rows):
+    """Parse priorities once for a snapshot without discarding duplicate slots."""
+    groups={}
+    for row in rows:
+        try:pref=int(row['pref'])
+        except (ValueError,TypeError,KeyError):continue
+        if 1<=pref<=65535:groups.setdefault(pref,[]).append(row)
+    return groups
+
+
 def tc_snapshot(iface):
     # One coherent read pass per audit/watch invocation, not per customer port.
-    return {
-        'qdiscs':tc_qdiscs(iface),
-        'rows':{d:tc_filters(iface,d) for d in ('ingress','egress')},
-        'text':{d:run(['tc','-s','filter','show','dev',iface,d]) for d in ('ingress','egress')},
-    }
+    qdiscs=tc_qdiscs(iface)
+    rows={d:tc_filters(iface,d) for d in ('ingress','egress')}
+    text={d:run(['tc','-s','filter','show','dev',iface,d]) for d in ('ingress','egress')}
+    return {'qdiscs':qdiscs,'rows':rows,'text':text,
+            'pref_groups':{d:_tc_pref_groups(rows[d]) for d in rows},
+            'text_index':{d:_tc_text_index(text[d]) for d in text}}
 
 def tc_ok(port,rec,iface,snap=None):
     try:
@@ -745,19 +826,29 @@ def tc_ok(port,rec,iface,snap=None):
         for direction in CHAIN:
             tcdir='ingress' if direction=='up' else 'egress'
             rows=snap['rows'][tcdir] if snap else tc_filters(iface,tcdir)
+            groups=snap.get('pref_groups',{}).get(tcdir) if snap else None
+            if groups is None:groups=_tc_pref_groups(rows)
             targets=[]
             for family in FAMILIES:
                 for transport in TRANSPORTS:
                     pref=tc_pref(port,family,transport,rec)
-                    if pref in _used_tc_prefs(rows,port,direction,family,transport):return False
-                    entry=tc_find(iface,port,direction,family,transport,rec,rows,strict=rec[direction]>0)
+                    slot_rows=groups.get(pref,[])
+                    if slot_rows:
+                        # Same foreign-slot rule as _used_tc_prefs, but O(1)
+                        # lookup instead of rebuilding all preferences 8x/port.
+                        details=[r for r in slot_rows if isinstance(r.get('options'),dict)]
+                        if not details or not all(_tc_slot_owned(r,port,direction,family,transport)
+                                                   for r in details):return False
+                    entry=tc_find(iface,port,direction,family,transport,rec,slot_rows,
+                                  strict=rec[direction]>0)
                     targets.append((family,transport,entry))
             if rec[direction]==0:
                 if any(entry for _,_,entry in targets) or tc_action_exists(tc_police_index(port,direction)):
                     return False
                 continue
             if not all(entry for _,_,entry in targets):return False
-            text=snap['text'][tcdir] if snap else run(['tc','-s','filter','show','dev',iface,tcdir])
+            text=(snap.get('text_index',{}).get(tcdir,snap['text'][tcdir])
+                  if snap else run(['tc','-s','filter','show','dev',iface,tcdir]))
             if not all(tc_rate_is_ok(entry,rec[direction],iface,direction,port,family,transport,rec,text)
                        for family,transport,entry in targets):return False
         return True
@@ -814,6 +905,12 @@ ROLLING_NEAR_LIMIT_BP=8500  # 85% of the *limited* rate, conservative lower boun
 ROLLING_DROP_FLOOR_BP=2000  # 20% of limited rate for meaningful drop pressure
 ROLLING_DROP_PPS=3          # sustained overlimits/drops per second
 ROLLING_CONFIRM_SECONDS=2.0
+# Monitoring at 100% with exact every-tick threshold misses sustained,
+# packetized TCP pressure (Helan: alternating ~9/11 Mbps at a 10 Mbps cap).
+# Require each sample to show >=85% of the REQUESTED trigger threshold,
+# and the full continuous candidate window to average >=100% of it.
+# This is not a lower auto-trigger threshold: both conditions are mandatory.
+MONITOR_ACTIVE_BP=8500
 
 
 
@@ -867,6 +964,7 @@ def auto_options(args):
 
 def empty_direction():
     return {'phase':'monitor','until':None,'high_since':None,'progress':0.0,
+            'monitor_start_bytes':None,
             'last':None,'mbps':None,'lower_mbps':None,'reason':'等待两个有效采样',
             'busy_since':None,'last_busy_at':None}
 
@@ -935,6 +1033,13 @@ def validate_record(port,rec):
             if (not isinstance(last.get('generation'),list)
                 or any(type(h) is not int or h<0 for h in last['generation'])):bad()
         if s['high_since'] is not None and (last is None or s['high_since']>last['end']):bad()
+        # Optional for old durable runtime records: old in-progress windows
+        # are safely restarted, not adopted with fabricated byte anchors.
+        anchor=s.get('monitor_start_bytes')
+        if anchor is not None:
+            if (type(anchor) is not int or not 0<=anchor<2**64
+                or s['phase']!='monitor' or s['high_since'] is None
+                or last is None or anchor>last['bytes']):bad()
 
 
 def volatile_path(port):
@@ -993,7 +1098,8 @@ def volatile_load(port,rec):
 
 
 def break_continuity(s,reason):
-    s.update(last=None,high_since=None,progress=0.0,mbps=None,lower_mbps=None,
+    s.update(last=None,high_since=None,monitor_start_bytes=None,
+             progress=0.0,mbps=None,lower_mbps=None,
              busy_since=None,reason=reason)
 
 
@@ -1027,7 +1133,7 @@ def traffic_snapshot():
     return {'start':start,'end':end,'blocks':police_blocks(output)}
 
 
-def traffic_sample(port,d,rec,snapshot,nft_items):
+def traffic_sample(port,d,rec,snapshot,nft_items,*,generation=None):
     if snapshot is None:raise Error('tc 统计快照不可用')
     block=snapshot['blocks'].get(tc_police_index(port,d),'')
     sent=re.findall(r'\bSent\s+([0-9]+)\s+bytes\s+([0-9]+)\s+pkt\s+' 
@@ -1044,8 +1150,9 @@ def traffic_sample(port,d,rec,snapshot,nft_items):
     # Quantized installed age defines an interval, not a fabricated exact birth.
     # Intersect it over successive samples to detect action recreation even if
     # the new counter has already overtaken the previous counter.
-    handles=sorted(r['rule']['handle'] for r in nft_items if 'rule' in r
-                   and r['rule'].get('comment','').startswith(f'pbw-{port}-{d}-'))
+    handles=(sorted(r['rule']['handle'] for r in nft_items if 'rule' in r
+                    and r['rule'].get('comment','').startswith(f'pbw-{port}-{d}-'))
+             if generation is None else list(generation.get((port,d),())))
     return {'bytes':count,'drops':drops,'overlimits':overlimits,
             'start':start,'end':end,
             'birth_lo':max(0.0,start-age-1.1),'birth_hi':end-age+0.1,
@@ -1104,20 +1211,49 @@ def observe(s,sample,base,options,limited=None):
         else:
             finalize_hold_activity(s,options['hold'])
             s['reason']='负载下降，等待滚动保护期结束'
-        s.update(high_since=None,progress=0.0)
+        s.update(high_since=None,monitor_start_bytes=None,progress=0.0)
         return True
     if s['phase']!='monitor':
-        s.update(high_since=None,progress=0.0,reason='冷却期间只展示采样');return True
-    # Use the longest possible interval for threshold testing (conservative).
-    above=Decimal(delta)*10000 >= Decimal(str(high))*base*options['trigger_bp']
-    if not above:
-        s.update(high_since=None,progress=0.0,reason='低于阈值，连续时间清零');return True
-    if s['high_since'] is None:s['high_since']=previous['end']
+        s.update(high_since=None,monitor_start_bytes=None,progress=0.0,
+                 reason='冷却期间只展示采样');return True
+    # A strict 100% EACH SECOND test loses continuous TCP congestion when
+    # a small tc police token bucket yields alternating 9/11 Mbps samples.
+    # Preserve the user-selected threshold as the required WHOLE-WINDOW
+    # mean. Ignore an isolated fast burst by also requiring EVERY sample
+    # to remain actively near the user-selected threshold (85% floor).
+    trigger=options['trigger_bp']
+    active=(Decimal(delta)*10000*10000 >=
+            Decimal(str(high))*base*trigger*MONITOR_ACTIVE_BP)
+    if not active:
+        s.update(high_since=None,monitor_start_bytes=None,progress=0.0,
+                 reason='负载明显低于阈值，连续窗口清零')
+        return True
+    if s['high_since'] is None or s.get('monitor_start_bytes') is None:
+        s['high_since']=previous['end']
+        s['monitor_start_bytes']=previous['bytes']
     s['progress']=max(0.0,sample['start']-s['high_since'])
-    s['reason']='连续窗口达到阈值'
+    s['reason']='持续有负载，等待整段窗口平均达到阈值'
     if s['progress']>=options['after']:
-        s.update(phase='entering',until=None,high_since=None,progress=0.0,
-                 last=None,busy_since=None,last_busy_at=None,reason='等待降速生效')
+        total=sample['bytes']-s['monitor_start_bytes']
+        duration=sample['end']-s['high_since']
+        reached=(duration>0 and Decimal(total)*10000 >=
+                 Decimal(str(duration))*base*trigger)
+        if reached:
+            s.update(phase='entering',until=None,high_since=None,
+                     monitor_start_bytes=None,progress=0.0,last=None,
+                     busy_since=None,last_busy_at=None,reason='整段窗口达到阈值，等待降速生效')
+        elif duration>=options['after']*2:
+            # Not enough evidence across TWO entire periods: slide the
+            # anchor to the previous sample rather than allowing an
+            # unbounded historic average to affect a future burst.
+            s.update(high_since=previous['end'],
+                     monitor_start_bytes=previous['bytes'],
+                     progress=max(0.0,sample['start']-previous['end']),
+                     reason='持续窗口仍未达阈值，重新累计')
+        else:
+            # Allow a short additional window for TCP 9/11 oscillation:
+            # the first 5 samples may average 9.4 while six average 10.
+            s['reason']='持续负载中，等待整段平均达到阈值'
     return True
 
 
@@ -1202,6 +1338,7 @@ def reconcile(config,monitor=False):
             volatile_load(port,rec)
     try:
         nft_items=ensure_base()
+        nft_index=_nft_watch_index(nft_items)
         tc_items=tc_snapshot(config['iface']) if config.get('tc_enabled') else None
     except Exception:
         for port,rec in rows.items():
@@ -1216,7 +1353,7 @@ def reconcile(config,monitor=False):
         except Error as e:traffic_error=str(e);failures.append(traffic_error)
     for port,rec in rows.items():
         try:
-            healthy=(not rec.get('pending') and nft_ok(port,rec,nft_items)
+            healthy=(not rec.get('pending') and nft_ok(port,rec,nft_items,validated=True,index=nft_index)
                      and (not config.get('tc_enabled') or tc_ok(port,rec,config['iface'],tc_items)))
             if 'auto' in rec:
                 if not healthy:
@@ -1230,7 +1367,7 @@ def reconcile(config,monitor=False):
                     for d in CHAIN:
                         try:
                             if traffic is None:raise Error(traffic_error)
-                            samples[d]=traffic_sample(port,d,rec,traffic,nft_items)
+                            samples[d]=traffic_sample(port,d,rec,traffic,nft_items,generation=nft_index['generation'])
                         except Error as e:
                             samples[d]=None;errors[d]=str(e)
                             if traffic is not None:failures.append(f'{port}/{d}: {e}')
