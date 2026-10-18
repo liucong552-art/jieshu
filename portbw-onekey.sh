@@ -6,7 +6,7 @@ set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-REF=8228d213964d763409d70da95bc380062ac35d5b
+REF=fe6930a9071f314e31b854c1a4515f1f5d983bff
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
 EXPECTED_SHA=66a79fd8ff9f4b00c43a62ef3530251cd6934301bfc5412d497b47d94a3f70d1
 SCRIPT_VERSION=portbw-helan-dual-auto-20261018
