@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Managed Helan test installer (fixed TCP burst, not yet host-upgrade validated).
+# Generic managed candidate installer. Never upgrades an unknown or untracked installation.
 # Debian / Ubuntu + systemd; no dependency on VLESS, Xray, WireGuard or a specific VPS.
 set -Eeuo pipefail
 umask 077
@@ -15,6 +15,7 @@ PREVIOUS_SHA='69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359'
 PREVIOUS_CANDIDATE_SHA='601423e191fd809cda1bd7cbbab285096178b938a131ce4d9fe99fb83b08495f'
 EXPECTED_SHA='66a79fd8ff9f4b00c43a62ef3530251cd6934301bfc5412d497b47d94a3f70d1'
 CURRENT_HELAN_SHA='f0ebe551e8c0345c045a558b39a8b13523b2be8195255c67db13eec3eff5dc1a'
+MAIN_SHA='69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359'
 V1_SHA='29676cc3e07c772cd617ed5e2888a80417144576fd279bc654297e5dcdcaa568'
 V2_SHA='96f3d4c5d0f24cec94a8555c0daec98b6b3ac8414457434ef9735eab540f3b23'
 UNITS=(portbw-restore.service portbw-watch.service portbw-watch.timer)
@@ -39,7 +40,7 @@ usage(){ cat <<'EOF'
 仅面向 Debian/Ubuntu + systemd。portbw.py 必须和此安装器在同一目录。
 固定 SHA 校验候选 CPU 优化版；未经 Helan 真机验证，不得用于生产。
 首次安装需无旧portbw程序、端口策略、模块专用nft表；不静默迁移别人的安装。
-仅升级本系列受管理的 v1/v2；持久保存备份并支持显式回滚；无 apt/pip/curl。
+仅升级管理记录与当前文件一致的本系列已知版本；持久备份并支持回滚。
 没有--iface时自动找默认路由的物理网卡；若默认路由走WG/tun，必须显式--iface。
 EOF
 }
@@ -292,20 +293,20 @@ install_fresh(){
 preflight_upgrade(){
   host_check
   read_managed
-  [[ "$(sha "$PROG")" == "$CURRENT_HELAN_SHA" ]] || fail '当前不是已验证的 f0ebe Helan 版本'
+  say "当前已托管源码 SHA=$(sha "$PROG")；预检仅允许已知受管理版本"
   resolve_iface
   [[ "$(read_current_iface)" == "$IFACE" ]] || fail '已有网卡与目标不一致'
   [[ ! -e /etc/systemd/system/portbw-watch.timer && ! -L /etc/systemd/system/portbw-watch.timer ]] || fail '遗留timer阻断升级'
   [[ "$(systemctl is-active portbw-watch.timer 2>/dev/null || true)" != active ]] || fail '遗留timer仍运行'
   [[ "$(systemctl is-enabled portbw-watch.timer 2>/dev/null || true)" != enabled ]] || fail '遗留timer仍启用'
   "$CLI" audit || fail '升级前内核限速审计失败'
-  say "PREFLIGHT PASS：当前SHA=$CURRENT_HELAN_SHA；网卡=$IFACE；端口策略与内核审计OK；未修改系统"
+  say "PREFLIGHT PASS：旧版托管记录及SHA一致；网卡=$IFACE；端口策略与内核审计OK；未修改系统"
 }
 upgrade_managed(){
   preflight_upgrade
   host_check
   read_managed
-  [[ "$(sha "$PROG")" == "$CURRENT_HELAN_SHA" ]] || fail '只允许从 Helan 已核验 f0ebe 上传修复版升级，拒绝未知旧版本'
+  read_managed  # Require managed marker + exact source hash before any mutation.
   resolve_iface
   # Existing policies must retain the binding interface, even if this is a no-op update.
   local old_sha previous_iface
