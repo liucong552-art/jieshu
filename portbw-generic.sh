@@ -37,6 +37,18 @@ case "$action" in
           -L /var/lib/portbw-resident-release/current.env ]];then
       echo "MODE=managed_upgrade_preflight"
       bash "$work/portbw-install.sh" preflight-upgrade "$@"
+    elif [[ -e /usr/local/lib/portbw/portbw.py ||
+            -L /usr/local/lib/portbw/portbw.py ||
+            -e /usr/local/sbin/portbw ||
+            -L /usr/local/sbin/portbw ||
+            -e /etc/portbw/config.json ||
+            -L /etc/portbw/config.json ]] ||
+         { [[ -d /var/lib/portbw/ports ]] &&
+           find /var/lib/portbw/ports -maxdepth 1 -type f -name '*.json' -print -quit | grep -q .; };then
+      echo 'MODE=legacy_unmanaged_existing_install'
+      echo 'STOP: existing portbw state without managed release marker; no installation/upgrade allowed.'
+      echo 'Preserve installed source, systemd unit/timer and all port records.'
+      exit 4
     else
       echo "MODE=clean_install_preflight"
       bash "$work/portbw-install.sh" check "$@"
