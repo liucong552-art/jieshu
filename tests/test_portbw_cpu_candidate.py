@@ -277,10 +277,13 @@ class BurstPolicyTests(unittest.TestCase):
         self.assertEqual(portbw.tc_burst_kb(20*125000,'up'),1024)
         self.assertEqual(portbw.tc_burst_kb(40*125000,'up'),1024)
 
-    def test_egress_unchanged(self):
-        for rate in (125000,2500000,5000000,12500000):
+    def test_egress_half_second_bounded(self):
+        for rate in (625000,1250000,2500000,5000000):
             self.assertEqual(portbw.tc_burst_kb(rate,'down'),
-                             max(64,min(1024,(rate//10+1023)//1024)))
+                             max(64,min(1024,(rate+2047)//2048)))
+        self.assertEqual(portbw.tc_burst_kb(625000,'down'),306)
+        self.assertEqual(portbw.tc_burst_kb(2500000,'down'),1024)
+        self.assertEqual(portbw.tc_burst_kb(5000000,'down'),1024)
 
     def test_ingress_bounded_and_monotonic(self):
         values=[portbw.tc_burst_kb(n,'up') for n in
