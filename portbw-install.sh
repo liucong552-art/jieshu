@@ -24,12 +24,14 @@ IFACE=''
 IFACE_EXPLICIT=0
 NFT_ONLY=0
 
-say(){ printf '[portbw-release] %s\n' "$*"; }
+say(){ printf '[portbw-release] %s
+' "$*"; }
 fail(){ say "STOP: $*" >&2; exit 1; }
 sha(){ sha256sum "$1" | awk '{print $1}'; }
 usage(){ cat <<'EOF'
 用法：
-  sudo bash portbw-install.sh preflight-upgrade [--iface eth0]\n  sudo bash portbw-install.sh check [--iface eth0] [--nft-only]
+  sudo bash portbw-install.sh preflight-upgrade [--iface eth0]
+  sudo bash portbw-install.sh check [--iface eth0] [--nft-only]
   sudo bash portbw-install.sh install [--iface eth0] [--nft-only]
   sudo bash portbw-install.sh verify
   sudo bash portbw-install.sh upgrade [--iface eth0]
@@ -55,7 +57,8 @@ done
 if [[ "$ACTION" == verify || "$ACTION" == rollback ]];then
   (( IFACE_EXPLICIT==0 && NFT_ONLY==0 )) || fail "$ACTION不接受网卡/模式参数"
 fi
-if [[ "$ACTION" == preflight-upgrade && "$NFT_ONLY" == 1 ]];then fail '预检升级不支持--nft-only';fi\nif [[ "$ACTION" == upgrade && "$NFT_ONLY" == 1 ]];then fail '已有策略升级不支持切换到--nft-only';fi
+if [[ "$ACTION" == preflight-upgrade && "$NFT_ONLY" == 1 ]];then fail '预检升级不支持--nft-only';fi
+if [[ "$ACTION" == upgrade && "$NFT_ONLY" == 1 ]];then fail '已有策略升级不支持切换到--nft-only';fi
 
 source_check(){
   [[ -f "$SOURCE" && ! -L "$SOURCE" ]] || fail "缺少同目录的portbw.py，或文件为符号链接：$SOURCE"
@@ -131,7 +134,8 @@ clean_check(){
   fi
   local nft_tables
   nft_tables="$(nft list tables)" || fail '无法查询nft tables；不能判断是否与旧规则冲突'
-  if printf '%s\n' "$nft_tables" | grep -Fxq 'table inet pbw_policy';then
+  if printf '%s
+' "$nft_tables" | grep -Fxq 'table inet pbw_policy';then
     fail '已有portbw专用nft表，拒绝按干净系统安装'
   fi
   resolve_iface
@@ -149,8 +153,10 @@ back_up(){
     if [[ -e "$p" || -L "$p" ]];then cp -a -- "$p" "$BACKUP/$i.old";fi
   done
   for u in "${UNITS[@]}";do
-    printf '%s\n' "$(systemctl is-enabled "$u" 2>/dev/null || true)" > "$BACKUP/$u.enabled"
-    printf '%s\n' "$(systemctl is-active "$u" 2>/dev/null || true)" > "$BACKUP/$u.active"
+    printf '%s
+' "$(systemctl is-enabled "$u" 2>/dev/null || true)" > "$BACKUP/$u.enabled"
+    printf '%s
+' "$(systemctl is-active "$u" 2>/dev/null || true)" > "$BACKUP/$u.active"
   done
   # For forensic recovery ONLY; restore never silently overwrites live policy
   # state files, which may contain newer administrator decisions.
@@ -218,7 +224,9 @@ transaction_exit(){
 }
 write_marker(){
   local backup="$1" tmp="$CURRENT.new.$$"
-  printf 'source_sha=%s\nbackup=%s\n' "$EXPECTED_SHA" "$backup" > "$tmp"
+  printf 'source_sha=%s
+backup=%s
+' "$EXPECTED_SHA" "$backup" > "$tmp"
   chmod 0600 "$tmp"
   mv -f -- "$tmp" "$CURRENT"
 }
@@ -287,7 +295,20 @@ install_fresh(){
   trap - EXIT
   say 'INSTALL PASS：修正版首次成功巡检验收；未改外部业务服务（仍需 VPS 实测）'
 }
-preflight_upgrade(){\n  host_check\n  read_managed\n  [[ "$(sha "$PROG")" == "$CURRENT_HELAN_SHA" ]] || fail '当前不是已验证的 f0ebe Helan 版本'\n  resolve_iface\n  [[ "$(read_current_iface)" == "$IFACE" ]] || fail '已有网卡与目标不一致'\n  [[ ! -e /etc/systemd/system/portbw-watch.timer && ! -L /etc/systemd/system/portbw-watch.timer ]] || fail '遗留timer阻断升级'\n  [[ "$(systemctl is-active portbw-watch.timer 2>/dev/null || true)" != active ]] || fail '遗留timer仍运行'\n  [[ "$(systemctl is-enabled portbw-watch.timer 2>/dev/null || true)" != enabled ]] || fail '遗留timer仍启用'\n  "$CLI" audit || fail '升级前内核限速审计失败'\n  say "PREFLIGHT PASS：当前SHA=$CURRENT_HELAN_SHA；网卡=$IFACE；端口策略与内核审计OK；未修改系统"\n}\nupgrade_managed(){\n  preflight_upgrade
+preflight_upgrade(){
+  host_check
+  read_managed
+  [[ "$(sha "$PROG")" == "$CURRENT_HELAN_SHA" ]] || fail '当前不是已验证的 f0ebe Helan 版本'
+  resolve_iface
+  [[ "$(read_current_iface)" == "$IFACE" ]] || fail '已有网卡与目标不一致'
+  [[ ! -e /etc/systemd/system/portbw-watch.timer && ! -L /etc/systemd/system/portbw-watch.timer ]] || fail '遗留timer阻断升级'
+  [[ "$(systemctl is-active portbw-watch.timer 2>/dev/null || true)" != active ]] || fail '遗留timer仍运行'
+  [[ "$(systemctl is-enabled portbw-watch.timer 2>/dev/null || true)" != enabled ]] || fail '遗留timer仍启用'
+  "$CLI" audit || fail '升级前内核限速审计失败'
+  say "PREFLIGHT PASS：当前SHA=$CURRENT_HELAN_SHA；网卡=$IFACE；端口策略与内核审计OK；未修改系统"
+}
+upgrade_managed(){
+  preflight_upgrade
   host_check
   read_managed
   [[ "$(sha "$PROG")" == "$CURRENT_HELAN_SHA" ]] || fail '只允许从 Helan 已核验 f0ebe 上传修复版升级，拒绝未知旧版本'
@@ -343,7 +364,8 @@ rollback_managed(){
   say 'ROLLBACK PASS：受管理文件与标记已恢复；内核策略未清空；仍应检查旧服务健康状态'
 }
 case "$ACTION" in
-  check)clean_check;;\n  preflight-upgrade)preflight_upgrade;;
+  check)clean_check;;
+  preflight-upgrade)preflight_upgrade;;
   install)install_fresh;;
   verify)verify;;
   upgrade)upgrade_managed;;
