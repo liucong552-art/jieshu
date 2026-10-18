@@ -905,6 +905,12 @@ ROLLING_NEAR_LIMIT_BP=8500  # 85% of the *limited* rate, conservative lower boun
 ROLLING_DROP_FLOOR_BP=2000  # 20% of limited rate for meaningful drop pressure
 ROLLING_DROP_PPS=3          # sustained overlimits/drops per second
 ROLLING_CONFIRM_SECONDS=2.0
+# Monitoring at 100% with exact every-tick threshold misses sustained,
+# packetized TCP pressure (Helan: alternating ~9/11 Mbps at a 10 Mbps cap).
+# Require each sample to show >=85% of the REQUESTED trigger threshold,
+# and the full continuous candidate window to average >=100% of it.
+# This is not a lower auto-trigger threshold: both conditions are mandatory.
+MONITOR_ACTIVE_BP=8500
 
 
 
@@ -958,6 +964,7 @@ def auto_options(args):
 
 def empty_direction():
     return {'phase':'monitor','until':None,'high_since':None,'progress':0.0,
+            'monitor_start_bytes':None,
             'last':None,'mbps':None,'lower_mbps':None,'reason':'等待两个有效采样',
             'busy_since':None,'last_busy_at':None}
 
@@ -1026,6 +1033,13 @@ def validate_record(port,rec):
             if (not isinstance(last.get('generation'),list)
                 or any(type(h) is not int or h<0 for h in last['generation'])):bad()
         if s['high_since'] is not None and (last is None or s['high_since']>last['end']):bad()
+        # Optional for old durable runtime records: old in-progress windows
+        # are safely restarted, not adopted with fabricated byte anchors.
+        anchor=s.get('monitor_start_bytes')
+        if anchor is not None:
+            if (type(anchor) is not int or not 0<=anchor<2**64
+                or s['phase']!='monitor' or s['high_since'] is None
+                or last is None or anchor>last['bytes']):bad()
 
 
 def volatile_path(port):
@@ -1084,7 +1098,8 @@ def volatile_load(port,rec):
 
 
 def break_continuity(s,reason):
-    s.update(last=None,high_since=None,progress=0.0,mbps=None,lower_mbps=None,
+    s.update(last=None,high_since=None,monitor_start_bytes=None,
+             progress=0.0,mbps=None,lower_mbps=None,
              busy_since=None,reason=reason)
 
 
@@ -1196,20 +1211,45 @@ def observe(s,sample,base,options,limited=None):
         else:
             finalize_hold_activity(s,options['hold'])
             s['reason']='负载下降，等待滚动保护期结束'
-        s.update(high_since=None,progress=0.0)
+        s.update(high_since=None,monitor_start_bytes=None,progress=0.0)
         return True
     if s['phase']!='monitor':
-        s.update(high_since=None,progress=0.0,reason='冷却期间只展示采样');return True
-    # Use the longest possible interval for threshold testing (conservative).
-    above=Decimal(delta)*10000 >= Decimal(str(high))*base*options['trigger_bp']
-    if not above:
-        s.update(high_since=None,progress=0.0,reason='低于阈值，连续时间清零');return True
-    if s['high_since'] is None:s['high_since']=previous['end']
+        s.update(high_since=None,monitor_start_bytes=None,progress=0.0,
+                 reason='冷却期间只展示采样');return True
+    # A strict 100% EACH SECOND test loses continuous TCP congestion when
+    # a small tc police token bucket yields alternating 9/11 Mbps samples.
+    # Preserve the user-selected threshold as the required WHOLE-WINDOW
+    # mean. Ignore an isolated fast burst by also requiring EVERY sample
+    # to remain actively near the user-selected threshold (85% floor).
+    trigger=options['trigger_bp']
+    active=(Decimal(delta)*10000*10000 >=
+            Decimal(str(high))*base*trigger*MONITOR_ACTIVE_BP)
+    if not active:
+        s.update(high_since=None,monitor_start_bytes=None,progress=0.0,
+                 reason='负载明显低于阈值，连续窗口清零')
+        return True
+    if s['high_since'] is None or s.get('monitor_start_bytes') is None:
+        s['high_since']=previous['end']
+        s['monitor_start_bytes']=previous['bytes']
     s['progress']=max(0.0,sample['start']-s['high_since'])
-    s['reason']='连续窗口达到阈值'
+    s['reason']='持续有负载，等待整段窗口平均达到阈值'
     if s['progress']>=options['after']:
-        s.update(phase='entering',until=None,high_since=None,progress=0.0,
-                 last=None,busy_since=None,last_busy_at=None,reason='等待降速生效')
+        total=sample['bytes']-s['monitor_start_bytes']
+        duration=sample['end']-s['high_since']
+        reached=(duration>0 and Decimal(total)*10000 >=
+                 Decimal(str(duration))*base*trigger)
+        if reached:
+            s.update(phase='entering',until=None,high_since=None,
+                     monitor_start_bytes=None,progress=0.0,last=None,
+                     busy_since=None,last_busy_at=None,reason='整段窗口达到阈值，等待降速生效')
+        else:
+            # A full near-capacity window did NOT reach the configured
+            # threshold: keep monitoring without falsely triggering.
+            # Start a fresh bounded evaluation window at this last sample.
+            s.update(high_since=previous['end'],
+                     monitor_start_bytes=previous['bytes'],
+                     progress=max(0.0,sample['start']-previous['end']),
+                     reason='整段平均低于阈值，重新累计窗口')
     return True
 
 
