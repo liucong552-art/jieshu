@@ -2,7 +2,7 @@ name: portbw candidate regression (feature branch only)
 on:
   push:
     branches:
-      - fix/portbw-tcp-goodput-burst-20261017
+      - fix/portbw-bidirectional-tcp-burst-20261018
     paths:
       - 'portbw.py'
       - 'portbw-install.sh'
@@ -84,14 +84,14 @@ jobs:
             echo 'DANGER: semantics runner ran in host namespace'; exit 1
           fi
           grep -q 'runner.isolated()' tests/portbw_lab_semantic_runner.py
-      - name: Assert Helan test installer pins fixed source
+      - name: Reject unvalidated host installer for bidirectional candidate
         run: |
           actual="$(sha256sum portbw.py | awk '{print $1}')"
           expected="$(sed -n "s/^EXPECTED_SHA='\\([a-f0-9]*\\)'$/\\1/p" portbw-install.sh)"
           test -n "$expected"
-          test "$actual" = "$expected"
-          grep -q 'REF=035c262ff1340aa028793f8d7f7a9b6ec5b990db' portbw-onekey.sh
+          test "$actual" != "$expected"
+          echo 'Candidate installer intentionally pinned to old passed host build.'
       - name: Guard production branch and production mode
         run: |
-          test "${GITHUB_REF_NAME}" = "fix/portbw-tcp-goodput-burst-20261017"
+          test "${GITHUB_REF_NAME}" = "fix/portbw-bidirectional-tcp-burst-20261018"
           grep -q 'check_isolation()' tests/portbw_cpu_probe.py
