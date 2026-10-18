@@ -1242,14 +1242,18 @@ def observe(s,sample,base,options,limited=None):
             s.update(phase='entering',until=None,high_since=None,
                      monitor_start_bytes=None,progress=0.0,last=None,
                      busy_since=None,last_busy_at=None,reason='整段窗口达到阈值，等待降速生效')
-        else:
-            # A full near-capacity window did NOT reach the configured
-            # threshold: keep monitoring without falsely triggering.
-            # Start a fresh bounded evaluation window at this last sample.
+        elif duration>=options['after']*2:
+            # Not enough evidence across TWO entire periods: slide the
+            # anchor to the previous sample rather than allowing an
+            # unbounded historic average to affect a future burst.
             s.update(high_since=previous['end'],
                      monitor_start_bytes=previous['bytes'],
                      progress=max(0.0,sample['start']-previous['end']),
-                     reason='整段平均低于阈值，重新累计窗口')
+                     reason='持续窗口仍未达阈值，重新累计')
+        else:
+            # Allow a short additional window for TCP 9/11 oscillation:
+            # the first 5 samples may average 9.4 while six average 10.
+            s['reason']='持续负载中，等待整段平均达到阈值'
     return True
 
 
