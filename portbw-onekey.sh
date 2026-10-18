@@ -6,10 +6,10 @@ set -Eeuo pipefail
 umask 077
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-REF=035c262ff1340aa028793f8d7f7a9b6ec5b990db
+REF=9117933d299ed21d5adf82e491ce8ec10ab0694f
 BASE=https://raw.githubusercontent.com/liucong552-art/jieshu
-EXPECTED_SHA=f0ebe551e8c0345c045a558b39a8b13523b2be8195255c67db13eec3eff5dc1a
-SCRIPT_VERSION=portbw-helan-tcp-burst-fix-20261017
+EXPECTED_SHA=66a79fd8ff9f4b00c43a62ef3530251cd6934301bfc5412d497b47d94a3f70d1
+SCRIPT_VERSION=portbw-helan-dual-auto-20261018
 fail(){ printf '拒绝继续：%s\n' "$*" >&2; exit 1; }
 
 [[ $(id -u) -eq 0 ]] || fail '请使用 root'
@@ -38,9 +38,9 @@ PY
 echo '候选版本源代码和安装器初步校验：通过'
 echo
 echo '请选择要在 Helan 执行的操作：'
-echo '  1) 只读预检查（不安装）'
-echo '  2) 快照恢复后全新安装 CPU+TCP 吞吐修复版（修改 Helan systemd/nft/tc）'
-echo '  3) 从已管理的旧版升级（先备份，修改 systemd/nft/tc）'
+echo '  1) 只读预检查当前已管理版本（不修改）'
+echo '  2) 不支持（本入口仅用于已有版本升级）'
+echo '  3) 从 f0ebe Helan 当前版升级（备份，保留端口策略）'
 echo '  4) 验证当前安装及 Watchdog'
 echo '  5) 回滚此安装器管理的优化版'
 echo '  6) 查看当前限速报告（只读）'
@@ -54,13 +54,8 @@ else
 fi
 case "$choice" in
   0) echo '已退出；没有改变限速配置。' ;;
-  1) bash "$WORK/portbw-install.sh" check --iface eth0 ;;
-  2)
-    echo '将安装独立限速组件；不自动创建任何端口策略，不操作 VLESS/WG 服务。'
-    bash "$WORK/portbw-install.sh" check --iface eth0
-    bash "$WORK/portbw-install.sh" install --iface eth0
-    echo '安装完成。使用 portbw report 查看；需要限速时再手动 portbw set <端口> <上行Mbps> <下行Mbps>。'
-    ;;
+  1) bash "$WORK/portbw-install.sh" preflight-upgrade --iface eth0 ;;
+  2) fail '此入口只允许已有 Helan 受管理版本升级，不提供全新安装' ;;
   3)
     echo '将升级已由 portbw 受管理的版本；保留已保存策略，并创建持久备份。'
     bash "$WORK/portbw-install.sh" upgrade --iface eth0
