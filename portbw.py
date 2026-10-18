@@ -597,11 +597,15 @@ def tc_burst_kb(rate,direction='down'):
     # Isolated kernel trials showed 1 MiB restores ~20 Mbps while retaining
     # both nft DROP and a single shared tc action across TCP/UDP and v4/v6.
     # Permit at most ~0.5s of tokens, capped at 1 MiB. Keep the existing
-    # smaller egress bucket until its own TCP behaviour has been verified.
+    # egress now uses the same capped half-second allowance after testing.
     if direction=='up':
         return max(64,min(1024,(rate+2047)//2048))
     if direction=='down':
-        return max(64,min(1024,(rate//10+1023)//1024))
+        # Real TCP receiver-goodput on Helan with the old 0.1s egress
+        # bucket was 0.315/7.586/17.645 Mbps under 5/20/40 Mbps caps.
+        # Half-second bounded burst gave 4.811/19.138/37.482 Mbps.
+        # Keep the configured sustained rate; allow bounded packet trains.
+        return max(64,min(1024,(rate+2047)//2048))
     raise Error('未知 tc 限速方向')
 
 def _tc_filter_body(text,port,direction,family,transport,pref):
