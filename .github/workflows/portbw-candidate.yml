@@ -29,6 +29,7 @@ on:
       - 'tests/portbw_lab_egress_tcp_goodput.py'
       - 'tests/test_portbw_egress_lab_paths.py'
       - 'tests/portbw_helan_egress_tcp_goodput.sh'
+      - 'tests/portbw_helan_bidirectional_accept.sh'
       - 'tests/portbw_helan_burst_semantic.sh'
       - '.github/workflows/portbw-candidate.yml'
   workflow_dispatch:
@@ -53,6 +54,7 @@ jobs:
           python3 -m py_compile tests/portbw_lab_egress_tcp_goodput.py
           python3 -m unittest discover -s tests -p 'test_portbw_egress_lab_paths.py' -v
           bash -n tests/portbw_helan_egress_tcp_goodput.sh
+          bash -n tests/portbw_helan_bidirectional_accept.sh
           grep -q -- "--skip-control" tests/portbw_helan_egress_tcp_goodput.sh
           bash -n tests/portbw_helan_burst_semantic.sh
           bash -n tests/portbw_helan_burst_semantic.sh
