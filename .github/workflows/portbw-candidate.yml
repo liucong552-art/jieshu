@@ -2,12 +2,13 @@ name: portbw candidate regression (feature branch only)
 on:
   push:
     branches:
-      - fix/portbw-bidirectional-tcp-burst-20261018
+      - fix/portbw-auto-sustained-window-20261018
     paths:
       - 'portbw.py'
       - 'portbw-install.sh'
       - 'portbw-onekey.sh'
       - 'tests/test_portbw_cpu_candidate.py'
+      - 'tests/test_portbw_auto_sustained_window.py'
       - 'tests/test_portbw_semantic_acceptance.py'
       - 'tests/portbw_cpu_probe.py'
       - 'tests/portbw_helan_ab.sh'
@@ -66,6 +67,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tests -p 'test_portbw_cpu_candidate.py' -v
           python3 -m unittest discover -s tests -p 'test_portbw_semantic_acceptance.py' -v
+          python3 -m unittest discover -s tests -p 'test_portbw_auto_sustained_window.py' -v
       - name: Verify benchmark host-namespace refusal
         shell: bash
         run: |
@@ -95,5 +97,5 @@ jobs:
           echo 'Candidate installer intentionally pinned to old passed host build.'
       - name: Guard production branch and production mode
         run: |
-          test "${GITHUB_REF_NAME}" = "fix/portbw-bidirectional-tcp-burst-20261018"
+          test "${GITHUB_REF_NAME}" = "fix/portbw-auto-sustained-window-20261018"
           grep -q 'check_isolation()' tests/portbw_cpu_probe.py
