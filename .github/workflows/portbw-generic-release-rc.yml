@@ -6,6 +6,7 @@ on:
     paths:
       - 'portbw.py'
       - 'portbw-install.sh'
+      - 'tests/**'
       - '.github/workflows/portbw-generic-release-rc.yml'
   workflow_dispatch:
 permissions:
