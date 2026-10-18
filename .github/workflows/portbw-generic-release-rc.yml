@@ -1,0 +1,29 @@
+name: portbw generic release candidate
+on:
+  push:
+    branches:
+      - release/portbw-generic-rc-20261018
+    paths:
+      - 'portbw.py'
+      - 'portbw-install.sh'
+      - 'tests/**'
+      - '.github/workflows/portbw-generic-release-rc.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Source and installer verification
+        run: |
+          set -euo pipefail
+          bash -n portbw-install.sh
+          python3 -B -m py_compile portbw.py
+          actual=$(sha256sum portbw.py | awk '{print $1}')
+          grep -Fqx "EXPECTED_SHA='$actual'" <(grep '^EXPECTED_SHA=' portbw-install.sh)
+          python3 -B -m unittest discover -s tests -p 'test_portbw_cpu_candidate.py' -v
+          python3 -B -m unittest discover -s tests -p 'test_portbw_auto_sustained_window.py' -v
+          python3 -B -m unittest discover -s tests -p 'test_portbw_semantic_acceptance.py' -v
+          test "$(grep -c '^[[:space:]]*def ' portbw.py)" -gt 40

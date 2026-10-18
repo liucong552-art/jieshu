@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generic managed installer for v1-compatible supervisor-only fix (UNVALIDATED ON VPS).
+# Generic managed candidate installer. Never upgrades an unknown or untracked installation.
 # Debian / Ubuntu + systemd; no dependency on VLESS, Xray, WireGuard or a specific VPS.
 set -Eeuo pipefail
 umask 077
@@ -11,7 +11,11 @@ CONF=/etc/portbw/config.json
 STATE=/var/lib/portbw-resident-release
 CURRENT="$STATE/current.env"
 SOURCE="$HERE/portbw.py"
-EXPECTED_SHA='69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359'
+PREVIOUS_SHA='69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359'
+PREVIOUS_CANDIDATE_SHA='601423e191fd809cda1bd7cbbab285096178b938a131ce4d9fe99fb83b08495f'
+EXPECTED_SHA='66a79fd8ff9f4b00c43a62ef3530251cd6934301bfc5412d497b47d94a3f70d1'
+KNOWN_TEST_SHA='f0ebe551e8c0345c045a558b39a8b13523b2be8195255c67db13eec3eff5dc1a'
+MAIN_SHA='69058c8069e78d902c4814e1300c5aa38e2b91340f936cdb9cdc09a14936f359'
 V1_SHA='29676cc3e07c772cd617ed5e2888a80417144576fd279bc654297e5dcdcaa568'
 V2_SHA='96f3d4c5d0f24cec94a8555c0daec98b6b3ac8414457434ef9735eab540f3b23'
 UNITS=(portbw-restore.service portbw-watch.service portbw-watch.timer)
@@ -26,21 +30,22 @@ fail(){ say "STOP: $*" >&2; exit 1; }
 sha(){ sha256sum "$1" | awk '{print $1}'; }
 usage(){ cat <<'EOF'
 用法：
-  sudo bash portbw-install.sh check [--iface eth0] [--nft-only]
-  sudo bash portbw-install.sh install [--iface eth0] [--nft-only]
+  sudo bash portbw-install.sh preflight-upgrade [--iface NAME]
+  sudo bash portbw-install.sh check [--iface NAME] [--nft-only]
+  sudo bash portbw-install.sh install [--iface NAME] [--nft-only]
   sudo bash portbw-install.sh verify
-  sudo bash portbw-install.sh upgrade [--iface eth0]
+  sudo bash portbw-install.sh upgrade [--iface NAME]
   sudo bash portbw-install.sh rollback
 
 仅面向 Debian/Ubuntu + systemd。portbw.py 必须和此安装器在同一目录。
-固定 SHA 校验候选修正版；以 helan 验证的 v1 为算法基准，修复常驻监督。
+固定 SHA 校验通用发布候选版；适用 Debian/Ubuntu + systemd，不绑定主机名。
 首次安装需无旧portbw程序、端口策略、模块专用nft表；不静默迁移别人的安装。
-仅升级本系列受管理的 v1/v2；持久保存备份并支持显式回滚；无 apt/pip/curl。
+仅升级管理记录与当前文件一致的本系列已知版本；持久备份并支持回滚。
 没有--iface时自动找默认路由的物理网卡；若默认路由走WG/tun，必须显式--iface。
 EOF
 }
 if (($#));then ACTION="$1";shift;else usage;exit 2;fi
-case "$ACTION" in -h|--help|help)usage;exit 0;;check|install|verify|upgrade|rollback);;*)usage;fail "未知操作：$ACTION";;esac
+case "$ACTION" in -h|--help|help)usage;exit 0;;check|install|verify|upgrade|rollback|preflight-upgrade);;*)usage;fail "未知操作：$ACTION";;esac
 while (($#));do
   case "$1" in
     --iface) (($# >= 2)) || fail '--iface缺少网卡';IFACE="$2";IFACE_EXPLICIT=1;shift 2;;
@@ -52,11 +57,12 @@ done
 if [[ "$ACTION" == verify || "$ACTION" == rollback ]];then
   (( IFACE_EXPLICIT==0 && NFT_ONLY==0 )) || fail "$ACTION不接受网卡/模式参数"
 fi
+if [[ "$ACTION" == preflight-upgrade && "$NFT_ONLY" == 1 ]];then fail '预检升级不支持--nft-only';fi
 if [[ "$ACTION" == upgrade && "$NFT_ONLY" == 1 ]];then fail '已有策略升级不支持切换到--nft-only';fi
 
 source_check(){
   [[ -f "$SOURCE" && ! -L "$SOURCE" ]] || fail "缺少同目录的portbw.py，或文件为符号链接：$SOURCE"
-  [[ "$(sha "$SOURCE")" == "$EXPECTED_SHA" ]] || fail "portbw.py 不是已经在helan实测成功的版本；实测SHA=$EXPECTED_SHA，当前SHA=$(sha "$SOURCE")"
+  [[ "$(sha "$SOURCE")" == "$EXPECTED_SHA" ]] || fail "portbw.py 与候选版目标SHA不一致；目标SHA=$EXPECTED_SHA，当前SHA=$(sha "$SOURCE")"
   python3 -B - "$SOURCE" <<'PY' || fail 'Python源码语法检查失败'
 import ast,sys
 with open(sys.argv[1],encoding='utf-8') as f:ast.parse(f.read())
@@ -79,7 +85,7 @@ read_managed(){
   [[ -f "$CURRENT" && ! -L "$CURRENT" ]] || fail "不存在通用安装器管理记录 $CURRENT；拒绝改写别的版本"
   local old
   old="$(sed -n 's/^source_sha=//p' "$CURRENT")"
-  [[ "$old" == "$V1_SHA" || "$old" == "$V2_SHA" || "$old" == "$EXPECTED_SHA" ]] || fail '当前安装记录不是已知 v1/v2/本发行版；拒绝覆盖'
+  [[ "$old" == "$V1_SHA" || "$old" == "$V2_SHA" || "$old" == "$PREVIOUS_SHA" || "$old" == "$PREVIOUS_CANDIDATE_SHA" || "$old" == "$EXPECTED_SHA" || "$old" == "$KNOWN_TEST_SHA" ]] || fail '当前安装记录不是已知 v1/v2/前一版/本候选版；拒绝覆盖'
   [[ -f "$PROG" && ! -L "$PROG" && "$(sha "$PROG")" == "$old" ]] || fail '当前已安装源码与管理记录不匹配；拒绝升级或回滚'
   [[ -L "$CLI" && "$(readlink "$CLI")" == "$PROG" ]] || fail '命令入口不是预期的portbw符号链接'
 }
@@ -165,7 +171,7 @@ restore_backup(){
     [[ -f "$b/0.old" && ! -L "$b/0.old" && -f "$b/6.old" ]] || { say '备份缺少有效旧程序/管理记录';return 1; }
     local oldsha
     oldsha="$(sed -n 's/^source_sha=//p' "$b/6.old")"
-    [[ "$oldsha" == "$V1_SHA" || "$oldsha" == "$V2_SHA" || "$oldsha" == "$EXPECTED_SHA" ]] || { say '备份版本标记不是已知发行版';return 1; }
+    [[ "$oldsha" == "$V1_SHA" || "$oldsha" == "$V2_SHA" || "$oldsha" == "$PREVIOUS_SHA" || "$oldsha" == "$PREVIOUS_CANDIDATE_SHA" || "$oldsha" == "$EXPECTED_SHA" || "$oldsha" == "$KNOWN_TEST_SHA" ]] || { say '备份版本标记不是已知发行版';return 1; }
     [[ "$(sha "$b/0.old")" == "$oldsha" ]] || { say '备份程序 SHA 校验失败；拒绝回滚';return 1; }
     [[ -L "$b/1.old" && "$(readlink "$b/1.old")" == "$PROG" ]] || { say '旧 CLI 不是预期符号链接；拒绝回滚';return 1; }
   fi
@@ -284,9 +290,22 @@ install_fresh(){
   trap - EXIT
   say 'INSTALL PASS：修正版首次成功巡检验收；未改外部业务服务（仍需 VPS 实测）'
 }
-upgrade_managed(){
+preflight_upgrade(){
   host_check
   read_managed
+  say "当前已托管源码 SHA=$(sha "$PROG")；预检仅允许已知受管理版本"
+  resolve_iface
+  [[ "$(read_current_iface)" == "$IFACE" ]] || fail '已有网卡与目标不一致'
+  [[ ! -e /etc/systemd/system/portbw-watch.timer && ! -L /etc/systemd/system/portbw-watch.timer ]] || fail '遗留timer阻断升级'
+  [[ "$(systemctl is-active portbw-watch.timer 2>/dev/null || true)" != active ]] || fail '遗留timer仍运行'
+  [[ "$(systemctl is-enabled portbw-watch.timer 2>/dev/null || true)" != enabled ]] || fail '遗留timer仍启用'
+  "$CLI" audit || fail '升级前内核限速审计失败'
+  say "PREFLIGHT PASS：旧版托管记录及SHA一致；网卡=$IFACE；端口策略与内核审计OK；未修改系统"
+}
+upgrade_managed(){
+  preflight_upgrade
+  host_check
+  read_managed  # Require managed marker + exact source hash before any mutation.
   resolve_iface
   # Existing policies must retain the binding interface, even if this is a no-op update.
   local old_sha previous_iface
@@ -312,7 +331,7 @@ upgrade_managed(){
   verify
   COMMITTED=1
   trap - EXIT
-  say 'UPGRADE PASS：通过原 v1 标准首次健康巡检；持久备份可回滚（仍需 VPS 实测）'
+  say 'UPGRADE PASS：通过常驻 Watchdog 首次健康巡检；持久备份可回滚（仍需 VPS 实测）'
 }
 rollback_managed(){
   host_check
@@ -340,6 +359,7 @@ rollback_managed(){
 }
 case "$ACTION" in
   check)clean_check;;
+  preflight-upgrade)preflight_upgrade;;
   install)install_fresh;;
   verify)verify;;
   upgrade)upgrade_managed;;

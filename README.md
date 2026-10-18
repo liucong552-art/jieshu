@@ -24,6 +24,13 @@
 - **主动握手探测**：NAT 出口机的 `nat.sh` 支持为各 Peer 发送定时数据探测包。该功能与 V4 的 Watchdog 握手时间修复不同；只更新 VPS 的 V4 不会替旧 Peer 自动创建 NAT 端探测定时器。
 - **生产升级提示**：优先做 VPS 快照和节点状态备份；在维护窗口升级，并确认回滚方法。安装 V4 管理模块可能刷新 nftables 规则与 systemd 定时器；无需为安装 V4 而重新创建现有节点或重新运行 WG 的 `init/add`。服务商按一小时平均 CPU 考核时，三分钟测量只能参考，不能代替完整一小时统计。
 
+## 正式端口限速版：通用 `portbw`（2026-10-18）
+
+- 适用于 Debian/Ubuntu + systemd，不限 Helan；`portbw-install.sh` 与 `portbw.py` 是正式配套文件，使用本仓库 `main` 的两条 `curl` 命令下载后，**必须继续执行 `check` 和 `install` 才真正安装。仅下载、`bash -n` 或 `check` 不会创建 `portbw` 命令。
+- 常驻 Watchdog 取代旧版每秒启动的 timer，双向独立自动触发；修复 TCP 上/下行 policer burst 过小导致的实际吞吐下降，并改进 100% 阈值附近的持续负载判定。**触发阈值仍为用户设置的 100%，85% 只用于判断样本持续性，不是把触发阈值降低到 85%。**
+- 曾在 2 vCPU、13 端口的 `vm-172` 上测得 Watchdog 五分钟单核 CPU 由旧版至少 14.916% 降至新版 4.306%；实际效果与端口、流量及服务器环境有关。相同源码也在 Helan 验证了下载/上传触发及恢复。此版**不会自动给任何端口创建限速策略**。
+- `check` 和 `verify` 为只读诊断；`install`、`upgrade`、`rollback` 会修改系统，请先做 VPS 快照。仅支持受本系列安装器管理、记录和源码 SHA 一致的旧版原地升级；从其他仓库安装的旧版请按下方迁移说明操作。所有命令**直接通过单词执行，不询问 1/2/3/4 数字选项**。
+
 ## 使用前准备
 
 - Debian 11+ 或 Ubuntu 20.04+
@@ -354,7 +361,7 @@ portbw report           # 一键查看所有静态、自动限速端口（中文
 
 #### 安装 / 更新 portbw（需要同时下载两个文件）
 
-**首次安装：** 在要限速的服务器上以 **root** 逐行执行。新版 `portbw-install.sh` 不自动联网获取 `portbw.py`，也不自动安装缺失的系统依赖，因此下面每一步都要保留。
+**干净服务器首次安装（正式版）：** 在要限速的 Debian/Ubuntu 服务器上以 **root** 逐行执行以下完整命令。安装器不自动下载配套 Python 文件，也不自动执行 apt，因此下面的依赖安装、两次下载、只读预检和实际安装都要保留；**不要停在 curl 或 check 那一步**。
 
 ```bash
 apt-get update && apt-get install -y curl ca-certificates python3 iproute2 nftables util-linux coreutils procps
@@ -362,20 +369,24 @@ curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/portbw-
 curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/portbw.py' -o /root/portbw.py
 bash /root/portbw-install.sh check
 bash /root/portbw-install.sh install
+bash /root/portbw-install.sh verify
 portbw report
+portbw audit
 ```
 
-`check` 是只读检查。**如果显示失败，先排查，不要跳过检查强行安装。** 如需手动指定物理网卡，可先运行 `ip -4 route get 1.1.1.1` 查看，再在 `check` 和 `install` 后分别加 `--iface eth0`（`eth0` 替换为真实网卡）。
+`check` 是只读预检，必须出现 `CHECK PASS`；`install` **才执行实际安装**，须出现 `INSTALL PASS` 和 `VERIFY PASS`；完成后 `command -v portbw` 应显示 `/usr/local/sbin/portbw`，Watchdog 应为 `active`。**如果预检失败，先排查，不要强行安装。** 如需手动指定物理网卡，可先运行 `ip -4 route get 1.1.1.1` 查看，再在 `check` 和 `install` 后分别加 `--iface eth0`（`eth0` 替换为实际的非隧道物理网卡）。首次安装不创建端口规则，请使用后面的 `portbw set` 或 `portbw auto set` 明确设置端口。
 
-**升级已由本系列安装器管理的 v1/v2 版：** 先重新下载上述两个文件，然后在维护窗口执行（不要重复使用首次安装命令）：
+**升级已由本系列通用安装器管理的已知 v1/v2/候选版：** 先按上述两条 `curl` 重新下载同一版安装器和源码，先记录当前的 `portbw report` 与 `portbw audit`，保存可恢复的 VPS 快照，再在维护窗口执行（不要重新执行首次安装 `install`）：
 
 ```bash
+bash /root/portbw-install.sh preflight-upgrade
 bash /root/portbw-install.sh upgrade
 bash /root/portbw-install.sh verify
 portbw report
+portbw audit
 ```
 
-升级工具只接受已知受管理版本。检测到其他旧版或其他来源的 nftables/tc 规则时会拒绝覆盖。需要时先记录 `portbw report` 输出；不要手动执行 `nft flush ruleset` 或删除网卡 root qdisc。升级器会保存备份，确需回滚时才执行 `bash /root/portbw-install.sh rollback`。
+首次安装的 `check` 要求干净环境，已有受管理安装要用 **`preflight-upgrade`**。升级工具只接受有 `/var/lib/portbw-resident-release/current.env` 管理记录，且已安装源码 SHA 与记录一致的受支持旧版；未知来源的旧版即使已有端口配置也**不允许直接覆盖或伪造管理记录**。安装器会持久保存备份，但不能取代 VPS 快照。不要执行 `nft flush ruleset`、`tc qdisc del ... root`，不要停止其他业务的 nft/tc 系统规则。
 #### 静态限速：设置、修改、取消
 
 ```bash
@@ -388,7 +399,7 @@ portbw audit            # 专门审计所有限速规则的 nft/tc 生效情况
 portbw del 40001        # 仅取消端口限速，不删除 VLESS 节点
 ```
 
-#### 自动限速：达到阈值后降速（V5.2.2）
+#### 自动限速：双向独立触发与恢复（2026-10-18 常驻版）
 
 以下以端口 `40001` 为例：平时上下行各 30 Mbps；达到本方向上限的 100% 并持续 5 秒后，该方向降至 15 Mbps；滚动保护至少 120 秒（2 分钟），持续高负载会续期；恢复后无冷却。**下列 Bash 数组含中文注释，整段复制即可执行**（不是把中文括号插在命令参数之间）。
 
@@ -415,7 +426,7 @@ portbw auto status 40001     # 查看自动限速、采样和滚动保护状态
 portbw auto off 40001        # 关闭自动模式，恢复基础上传/下载限速
 ```
 
-`--trigger 100` 表示**基础速度的 100%**，不是整台服务器总带宽的 100%，也不是 100 Mbps。由于采样和限速波动，设置 100% 时即使接近 30 Mbps，也可能尚未达到触发条件。`--after 5s` 是连续达到门槛 5 秒才触发，不是流量一超过就立即降速。`--hold 120s` 是**至少 2 分钟**，持续接近 15 Mbps 或持续超限丢包时会滚动续期；`--cooldown 0s` 只取消恢复后的等待，再次降速仍需重新满足 5 秒的触发条件。
+`--trigger 100` 表示**基础速度的 100%**，不是整台服务器总带宽的 100%，也不是 100 Mbps。新版对接近阈值的连续样本使用 85% **连续性判定下界**，但最终持续窗口仍要求达到用户设定的 100% 整体触发门槛，**并非降到 85% 即触发**；不满足条件不会强制降速。`--after 5s` 是在符合连续和窗口条件后触发。`--hold 120s` 是**至少 2 分钟**，持续接近降速上限或持续超限丢包时可滚动续期；`--cooldown 0s` 取消恢复后的冷却，再次降速仍需重新满足触发条件。
 
 自动模式中只有 `--cooldown` 可以省略（省略默认 `60s`，**零冷却必须明确写 `--cooldown 0s`**），其他参数均为必填；上下行基础速度必须分别大于降速值，且均大于 0。`--trigger` 必须填写，单位为百分比（可填 100），不是 Mbps。`portbw down 40001 30` 只会直接改成**静态下载限速 30 Mbps**，不会设置自动触发门槛，且手动修改会关闭该端口的自动模式。
 
@@ -456,7 +467,7 @@ TZ=Asia/Shanghai journalctl -u portbw-watch.service \
 
 其中 `up` 表示上传方向，`down` 表示下载方向。日志可能包含参数修改**之前**的历史记录；例如旧版显示 `自动降速 15 Mbps / 恢复基础速度 30 Mbps`，不代表现在仍使用旧限速。**当前配置请以 `portbw report` 和 `portbw audit` 为准。** 没有触发日志，也不代表基础限速失效；历史保存时长受 `systemd-journald` 的自动轮替、磁盘容量和保留策略影响。
 
-**旧版限速迁移注意：** 本次升级改变了 tc flower 的协议槽位（从 TCP 专用改为 TCP+UDP 双协议）和保存的 `tc_prefs` 格式。**已使用旧版 `portbw` 创建策略的 VPS 不能保证直接无中断升级**。升级前先用旧版查询功能记录所有端口及速率；如需迁移，请在维护时段用**旧版** `portbw del <端口>` 逐个取消旧策略，确认旧 tc/nft 规则已清除后再运行上述新安装器，最后按记录重新执行 `portbw set`。取消到重建之间，该端口暂不受 portbw 限制。**不要手动 `nft flush ruleset` 或删除网卡 root qdisc**；发现旧规则残留应先检查，不要强制清理其他业务的规则。未安装过 portbw 的全新 VPS 可直接安装。
+**其他旧仓库/无管理记录版本的迁移（不能直接 `install`/`upgrade`）：** 特别是 `zuizhongheji` 等独立旧版及使用旧 tc flower 槽位的机器，先记录每个端口的**基础上/下行、降速上/下行、触发百分比、持续秒数、滚动保护、冷却**，执行 `portbw report` 与 `portbw audit` 并制作 VPS 快照。只可在维护窗口按照确切旧版校验过的迁移工具或逐端口安全删除方法移除旧限速，再安装此通用版并重新添加规则；在删除到重建期间可能暂时失去限速保护。不要把普通安装器用于未知来源旧版本，更不要手动清空整个 nftables ruleset、网卡 root qdisc 或其他业务规则。
 
 
 ## 五、部署 WG-NAT
@@ -809,7 +820,7 @@ socks5-traffic 41004                # 查看端口 41004 最近 30 天的每日�
 
 SOCKS5 与 VLESS 使用**同一套独立 `portbw` 限速方法**，无需重复设置命令。请在**实际运行 SOCKS5 的家宽主机**按照前文“可选：TCP+UDP 同端口共享限速（portbw）”安装并设置；把示例里的 `40001` 改成 SOCKS5 的**本机监听端口**（如 `41004`），即可使用相同的静态限速或 **30→15 Mbps、100% 持续 5 秒、滚动保护 120 秒、零冷却**的自动限速。查询所有端口时，同样使用前文的 `portbw report`。
 
-**注意：** 如果路由器把公网端口 `51004` 映射到家宽主机的 `41004`，限速应设置在本机端口 **`41004`**，不是公网端口 `51004`。SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按本机端口管理 TCP+UDP。SOCKS5 账号创建、到期、删除均不会自动增删 `portbw` 规则；升级 `portbw` 也不会修改 SOCKS5 账号、配额和服务。已安装旧版 `portbw` 的主机先参考前文“旧版升级注意”迁移规则。
+**注意：** 如果路由器把公网端口 `51004` 映射到家宽主机的 `41004`，限速应设置在本机端口 **`41004`**，不是公网端口 `51004`。SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按本机端口管理 TCP+UDP。SOCKS5 账号创建、到期、删除均不会自动增删 `portbw` 规则；升级 `portbw` 也不会修改 SOCKS5 账号、配额和服务。已安装非本系列管理的旧版 `portbw` 的主机先参考前文“其他旧仓库/无管理记录版本的迁移”安全迁移；已有受管理版本按 `preflight-upgrade` / `upgrade` 操作。
 
 ## 九、V4 正式版运行规则及生产升级注意事项
 
