@@ -10,6 +10,7 @@ on:
       - 'portbw-generic.sh'
       - 'portbw-migrate-legacy.py'
       - 'tests/portbw_cpu_5min.py'
+      - 'tests/portbw_helan_final_gate.sh'
       - 'tests/test_portbw_cpu_candidate.py'
       - 'tests/test_portbw_auto_sustained_window.py'
       - 'tests/portbw_helan_auto_window_accept.sh'
@@ -54,6 +55,7 @@ jobs:
           bash -n portbw-install.sh
           bash -n portbw-onekey.sh
           bash -n portbw-generic.sh
+          bash -n tests/portbw_helan_final_gate.sh
           python3 -m py_compile portbw-migrate-legacy.py tests/portbw_cpu_5min.py
           python3 -m py_compile tests/portbw_helan_up_diagnose.py tests/portbw_lab_tcp_goodput.py tests/portbw_helan_live_path_diagnose.py
           bash -n tests/portbw_helan_tcp_goodput.sh
