@@ -24,8 +24,7 @@ IFACE=''
 IFACE_EXPLICIT=0
 NFT_ONLY=0
 
-say(){ printf '[portbw-release] %s
-' "$*"; }
+say(){ printf '[portbw-release] %s\n' "$*"; }
 fail(){ say "STOP: $*" >&2; exit 1; }
 sha(){ sha256sum "$1" | awk '{print $1}'; }
 usage(){ cat <<'EOF'
@@ -134,8 +133,7 @@ clean_check(){
   fi
   local nft_tables
   nft_tables="$(nft list tables)" || fail '无法查询nft tables；不能判断是否与旧规则冲突'
-  if printf '%s
-' "$nft_tables" | grep -Fxq 'table inet pbw_policy';then
+  if printf '%s\n' "$nft_tables" | grep -Fxq 'table inet pbw_policy';then
     fail '已有portbw专用nft表，拒绝按干净系统安装'
   fi
   resolve_iface
@@ -153,10 +151,8 @@ back_up(){
     if [[ -e "$p" || -L "$p" ]];then cp -a -- "$p" "$BACKUP/$i.old";fi
   done
   for u in "${UNITS[@]}";do
-    printf '%s
-' "$(systemctl is-enabled "$u" 2>/dev/null || true)" > "$BACKUP/$u.enabled"
-    printf '%s
-' "$(systemctl is-active "$u" 2>/dev/null || true)" > "$BACKUP/$u.active"
+    printf '%s\n' "$(systemctl is-enabled "$u" 2>/dev/null || true)" > "$BACKUP/$u.enabled"
+    printf '%s\n' "$(systemctl is-active "$u" 2>/dev/null || true)" > "$BACKUP/$u.active"
   done
   # For forensic recovery ONLY; restore never silently overwrites live policy
   # state files, which may contain newer administrator decisions.
@@ -224,9 +220,7 @@ transaction_exit(){
 }
 write_marker(){
   local backup="$1" tmp="$CURRENT.new.$$"
-  printf 'source_sha=%s
-backup=%s
-' "$EXPECTED_SHA" "$backup" > "$tmp"
+  printf 'source_sha=%s\nbackup=%s\n' "$EXPECTED_SHA" "$backup" > "$tmp"
   chmod 0600 "$tmp"
   mv -f -- "$tmp" "$CURRENT"
 }
