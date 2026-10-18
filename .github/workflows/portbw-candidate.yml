@@ -9,6 +9,7 @@ on:
       - 'portbw-onekey.sh'
       - 'tests/test_portbw_cpu_candidate.py'
       - 'tests/test_portbw_auto_sustained_window.py'
+      - 'tests/portbw_helan_auto_window_accept.sh'
       - 'tests/test_portbw_semantic_acceptance.py'
       - 'tests/portbw_cpu_probe.py'
       - 'tests/portbw_helan_ab.sh'
@@ -56,6 +57,7 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_portbw_egress_lab_paths.py' -v
           bash -n tests/portbw_helan_egress_tcp_goodput.sh
           bash -n tests/portbw_helan_bidirectional_accept.sh
+          bash -n tests/portbw_helan_auto_window_accept.sh
           grep -q -- "--skip-control" tests/portbw_helan_egress_tcp_goodput.sh
           bash -n tests/portbw_helan_burst_semantic.sh
           bash -n tests/portbw_helan_burst_semantic.sh
