@@ -858,3 +858,37 @@ wg show wg-exit latest-handshakes
 ---
 
 请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。
+
+## 测试分支：SOCKS5 访问日志审计（尚未通过真机验收）
+
+> 仅存在于 feature/socks5-access-audit 分支。本功能默认对所有新建账号开启；
+> 更新已有 SOCKS5 时会迁移旧账号并逐个短暂重启正在运行的旧服务。
+> **在独立测试机完成验收前，不要将其应用到生产 VPS，不要合并到 main。**
+
+**旧机升级（先做完整快照，独立测试机）：**
+
+```bash
+S5_SOURCE_REF=feature/socks5-access-audit bash <(curl -fsSL \
+  https://raw.githubusercontent.com/liucong552-art/jieshu/feature/socks5-access-audit/socks5-install.sh) update
+```
+
+**新机安装（干净 Debian 12 测试机）：**
+
+```bash
+AUTO_DEPS=1 S5_SOURCE_REF=feature/socks5-access-audit bash <(curl -fsSL \
+  https://raw.githubusercontent.com/liucong552-art/jieshu/feature/socks5-access-audit/socks5-install.sh) install
+```
+
+**按端口和时间窗口查询（与 VLESS 四项报表对齐）：**
+
+```bash
+PORT=40007
+DAYS=7
+socks5 access "$PORT" "$DAYS"
+```
+
+输出四部分：成功请求域名 Top 20、成功请求来源 IP 历史 Top 20、同一分钟出现多个来源 IP 的最新 30 条、当前已建立 TCP 连接的来源 IP。全部按北京时间显示。原有的 `socks5 audit 40007` 依然是服务/防护审计，不会被替换。
+
+日志格式由 3proxy 的 `log` 和 `logformat` 输出到每个实例的 systemd journal，未改动账号密码、ACL、IP 限制、总配额或端口限速配置。**日志从开启后才产生**；仅能统计已结束并记录的连接，直接 IP 连接不能反推出域名。journald 有自己的保存限制，查询 7 天不保证已经保存 7 天。
+
+完整旧机与新机真机验收步骤见 [测试门槛文档](tests/SOCKS5_AUDIT_REAL_MACHINE_ACCEPTANCE.md)。CI 通过不等于真机验收成功；main 暂不包含上述功能。
