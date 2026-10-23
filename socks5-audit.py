@@ -130,15 +130,26 @@ def display(port: int, days: int, unit: str, *, journal_lines=None, ss_snapshot=
     start = end - days * 86400
     if journal_lines is None:
         since = dt.datetime.fromtimestamp(start, UTC).strftime("%Y-%m-%d %H:%M:%S")
-        result = subprocess.run(
-            ["journalctl", "-u", unit, "--since", since, "-o", "cat", "--no-pager", "--quiet"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            timeout=120, check=False, env={"TZ": "UTC", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
-        )
-        if result.returncode:
-            raise RuntimeError("journalctl 查询失败: " + result.stderr.strip()[:250])
-        journal_lines = result.stdout.splitlines()
-    domains, clients, first, last, minutes, events, invalid, failed = summarize(journal_lines, start, end)
+        # Stream only matching access records rather than buffering a whole
+        # journal query in the Python process (important on busy machines).
+        args = ["journalctl", "-u", unit, "--since", since, "--grep", MARKER,
+                "-o", "cat", "--no-pager", "--quiet"]
+        with subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={"TZ": "UTC", "PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+        ) as process:
+            try:
+                stats = summarize(process.stdout, start, end)
+                status = process.wait(timeout=120)
+            except Exception:
+                process.kill()
+                process.wait()
+                raise
+            if status:
+                raise RuntimeError("journalctl 查询失败: " + process.stderr.read().strip()[:250])
+    else:
+        stats = summarize(journal_lines, start, end)
+    domains, clients, first, last, minutes, events, invalid, failed = stats
     print("=" * 64)
     print(f"SOCKS5 端口 {port} | 过去 {days} 天 | 结果按北京时间展示")
     print("=" * 64)
