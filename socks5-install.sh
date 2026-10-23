@@ -39,7 +39,7 @@ if [[ "$ACTION" != deps ]];then
   fi
   expected_core="cda9f47a10aa8e15fd101ba94b00ce34e3a85378dadcd8d303e0487ffe797b18"
   expected_traffic="134bcd2a2ee8947bcad3bad09c6f0d50ea5474249701758c514a2294274deb23"
-  expected_audit="5a9d0ab9309891e26b2259a63844fd9c1be8982cf5c9eaafed9a619e92b1f50a"
+  expected_audit="f33c774a2c5973ebe28e36e01f66906363dbecda3f6895c8629d11b76b60be82"
   actual_audit="$(sha256sum "$SRC_DIR/socks5-audit.py" | awk '{print $1}')"
   actual_core="$(sha256sum "$SRC_DIR/socks5.py" | awk '{print $1}')"
   actual_traffic="$(sha256sum "$SRC_DIR/socks5-traffic.py" | awk '{print $1}')"
