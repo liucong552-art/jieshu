@@ -1,0 +1,22 @@
+name: SOCKS5 access audit (staging only)
+on:
+  push:
+    branches:
+      - feature/socks5-access-audit
+  workflow_dispatch:
+jobs:
+  offline-audit-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check syntax and four-part audit behavior
+        run: |
+          python3 -m py_compile socks5.py socks5-traffic.py socks5-audit.py
+          bash -n socks5-install.sh
+          python3 -m unittest discover -s tests -p test_socks5_access_audit.py -v
+      - name: Confirm staging is NOT real-machine acceptance
+        run: |
+          echo 'Offline CI succeeded or failed independently of required real-host tests.'
+          echo 'Never merge to main based only on CI.'
