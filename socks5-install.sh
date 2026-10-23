@@ -25,7 +25,7 @@ if [[ "$ACTION" != deps ]];then
     command -v curl >/dev/null || { echo '缺少 curl；请先安装 curl ca-certificates' >&2;exit 1; }
     FETCH_DIR="$(mktemp -d /tmp/socks5-source.XXXXXXXX)"
     chmod 0700 "$FETCH_DIR"
-    S5_SOURCE_REF="${S5_SOURCE_REF:-main}"
+    S5_SOURCE_REF="${S5_SOURCE_REF:-feature/socks5-access-audit}"
     case "$S5_SOURCE_REF" in
       main|feature/socks5-access-audit) ;;
       *) echo '拒绝未知源码分支，请使用 main 或 feature/socks5-access-audit' >&2; exit 1 ;;
