@@ -187,5 +187,132 @@ def display(port: int, days: int, unit: str, *, journal_lines=None, ss_snapshot=
         print("警告：指定时间段没有可识别的 S5AUDIT 记录；不能据此判断无人使用或没有滥用。")
 
 
+def _audit_scan(port, days, unit, collector, journal_lines):
+    """Share the identical timestamp, validation and journal window for extras.
+
+    The existing 'socks5 access' four-section display is left untouched.
+    """
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("PORT 必须是有效数字端口")
+    if type(days) is not int or not 1 <= days <= MAX_DAYS:
+        raise ValueError(f"DAYS 必须是 1～{MAX_DAYS} 的整数")
+    if not re.fullmatch(r"socks5-@[A-Za-z0-9][A-Za-z0-9_.-]{0,47}\.service", unit):
+        raise ValueError("非法 SOCKS5 service")
+    end = int(dt.datetime.now(UTC).timestamp())
+    start = end - days * 86400
+    if journal_lines is not None:
+        return collector(journal_lines, start, end)
+    since = dt.datetime.fromtimestamp(start, UTC).strftime("%Y-%m-%d %H:%M:%S")
+    args = ["journalctl", "-u", unit, "--since", since, "--grep", MARKER,
+            "-o", "cat", "--no-pager", "--quiet"]
+    with subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={"TZ":"UTC", "PATH":"/usr/sbin:/usr/bin:/sbin:/bin"},
+    ) as process:
+        try:
+            report = collector(process.stdout, start, end)
+            status = process.wait(timeout=120)
+        except Exception:
+            process.kill()
+            process.wait()
+            raise
+        if status:
+            raise RuntimeError("journalctl 查询失败: " + process.stderr.read().strip()[:250])
+        return report
+
+
+def display_all_domains(port: int, days: int, unit: str, *, journal_lines=None):
+    """An additive full listing; counts must equal the unchanged Top 20 report."""
+    domains, clients, first, last, minutes, events, invalid, failed = _audit_scan(
+        port, days, unit, summarize, journal_lines)
+    print("=" * 64)
+    print(f"SOCKS5 端口 {port} | 过去 {days} 天 | 全部原始域名（北京时间）")
+    print("=" * 64)
+    print("【全部成功连接域名排行：不截断前 20 名】")
+    if domains:
+        for i, (name, count) in enumerate(
+            sorted(domains.items(), key=lambda x: (-x[1], x[0])), 1
+        ):
+            print(f"{i:3d}. {name:<40s} {count} 次连接")
+    else:
+        print("暂无可识别的网站域名记录")
+    print(f"域名总数：{len(domains)} 个；有域名的成功连接：{sum(domains.values())} 次。")
+    print(f"读取到访问记录：{events} 条（成功 {events-failed}、错误码非零 {failed}、不完整 {invalid}）。")
+    print("与 socks5 access 的域名 Top 20 使用完全相同的成功连接和域名识别规则。")
+    print("IP 目标、不完整日志及未结束或未记录连接不计入域名排行。")
+    if events == 0:
+        print("警告：当前未找到可识别的访问日志，不代表没有代理使用记录。")
+
+
+def collect_error_details(lines, start: int, end: int, *, limit=50):
+    """Count every nonzero valid 3proxy result; optionally retain all details.
+
+    Keeping only N newest records avoids large in-memory buffers on busy VPSes.
+    Even when limited, error-code counts always cover the entire time window.
+    """
+    import heapq
+    if limit is not None and (type(limit) is not int or not 1 <= limit <= 10000):
+        raise ValueError("LIMIT 必须为 1～10000，或者使用 --all")
+    codes = collections.Counter()
+    valid = 0
+    invalid = 0
+    heap = []
+    for seq, line in enumerate(lines):
+        if MARKER not in line:
+            continue
+        rec = parse_record(line, start, end)
+        if rec is None:
+            invalid += 1
+            continue
+        stamp, err, client, domain, remote, remote_port = rec
+        valid += 1
+        if err == 0:
+            continue
+        codes[err] += 1
+        raw_hostname = line.strip().split()[5]
+        # This is only the requested host field, not a verified website visit.
+        target = domain if domain is not None else f"{raw_hostname}（非有效域名）"
+        item = (stamp, seq, err, client, target, remote, remote_port)
+        if limit is None:
+            heap.append(item)
+        elif len(heap) < limit:
+            heapq.heappush(heap, item)
+        elif (stamp, seq) > heap[0][:2]:
+            heapq.heapreplace(heap, item)
+    return codes, sorted(heap, reverse=True), valid, invalid
+
+
+def display_error_details(port: int, days: int, unit: str, *,
+                          journal_lines=None, limit=50):
+    if limit is not None and (type(limit) is not int or not 1 <= limit <= 10000):
+        raise ValueError("LIMIT 必须为 1～10000，或者使用 --all")
+    def collector(lines, start, end):
+        return collect_error_details(lines, start, end, limit=limit)
+    codes, details, valid, invalid = _audit_scan(
+        port, days, unit, collector, journal_lines)
+    errors = sum(codes.values())
+    print("=" * 64)
+    print(f"SOCKS5 端口 {port} | 过去 {days} 天 | 非零错误码详情（北京时间）")
+    print("=" * 64)
+    print("【所有错误码汇总：统计整个查询时间段】")
+    if codes:
+        for err, count in sorted(codes.items(), key=lambda x: (-x[1], x[0])):
+            print(f"  错误码={err:05d} | {count} 次")
+    else:
+        print("暂无非零错误码记录")
+    print(f"【最近错误详情：显示 {len(details)} / {errors} 条】")
+    for i, (stamp, seq, err, client, target, remote, remote_port) in enumerate(details, 1):
+        print(f"{i:3d}. 日志时间={bj_time(stamp)} | 错误码={err:05d} | 来源IP={client}")
+        print(f"     目标主机={target} | 目标IP={remote} | 目标端口={remote_port}")
+    print(f"读取到访问记录：{valid} 条（成功 {valid-errors}、错误码非零 {errors}、不完整 {invalid}）。")
+    print("错误码仅代表 3proxy 连接结果，不等于 HTTP 状态码，也不能单独证明恶意或侵权行为。")
+    print("日志时间通常是连接结束后的记录时间；无有效域名时不推断真实访问域名。")
+    if limit is not None and errors > limit:
+        print("如需查看时间范围内所有错误明细：socks5 access-errors "
+              f"{port} {days} --all")
+    if valid == 0:
+        print("警告：未找到可识别的代理记录，不代表没有使用行为。")
+
+
 if __name__ == "__main__":
     raise SystemExit("请使用 socks5 access <端口> [天数]")
