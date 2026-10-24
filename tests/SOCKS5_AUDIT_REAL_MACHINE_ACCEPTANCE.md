@@ -55,19 +55,15 @@ Repeat all access/ACL/traffic/journal isolation/reboot tests from above.
 Record real OS/kernel, 3proxy package and version, machine type, test time, masked evidence, tester and pass/fail for every item. Until both scenarios pass, this branch is **NOT RELEASE READY**. No merge or deployment to production is approved by this document.
 
 
-## Blacklist acceptance gate: global/all and single-port scopes
+## Additional read-only reports acceptance (no blacklist features)
 
-This section adds mandatory real 3proxy checks; simulated ACL generation alone does not demonstrate blocking actually works.
+Before any main merge, on both **old-machine upgrade** and **fresh-machine** scenarios, use real external clients and a known set of completed connections:
 
-1. In a test host with at least two authenticated, live SOCKS5 ports, run block-list all, block-list PORT1, block-list PORT2. Record ACLs and a successful external CONNECT baseline.
-2. Run `socks5 block-add PORT1 example.com` on an isolated test target. Check PORT1 refuses hostname-based CONNECT for example.com AND www.example.com, while PORT2 still permits it and both services remain healthy. Existing password/quotas/IP guards must not change.
-3. Run `socks5 block-del PORT1 example.com`; check PORT1 connects again and PORT2 stays untouched.
-4. Run `socks5 block-add all example.com --confirm`; check BOTH existing ports reject apex and subdomain targets; new port created AFTER the global change must inherit the deny rule automatically.
-5. Run `socks5 block-del all example.com --confirm`; verify both old and new ports recover access after the required restarts.
-6. Verify IPv4/CIDR target blocks, raw IP connects, case-folding, invalid inputs, duplicates, no-ops, max limit and deny operation order.
-7. Trigger a mocked/service-level failure on the SECOND restart during global update, verify on-host rollback of blacklist.json, each generated config, original active state, credentials, guard, quota and connectivity.
-8. Confirm rejected connections are visible in the relevant unit journal with the 3proxy error code; verify no unrelated unit records are mixed into per-port access reports.
-9. After test host reboot and after running update installer twice, confirm inherited and per-port rules persist and restart cleanly.
-10. Measure interruptions and disk usage. **A passing GitHub Actions job is not evidence of real blocking or recovery.**
+1. `socks5 access PORT 7` must print its **original four** panels with identical domain Top 20, IP counts/timestamps, same-minute events, and live TCP count as before.
+2. `socks5 access-domains PORT 7` must list **all** names in the same descending-count/lexicographic tie order as the original Top 20. First twenty pairs (name, connection count) must be byte-for-byte identical after stripping only list numbering and spacing. No domain merging, inferred TLD, third-party filtering, or cross-port leakage.
+3. Create completed connections with normal result `00000` and failures including `00010`, `00095`, `00100`. `socks5 access-errors PORT 7` must show code-by-code totals across the full date range and up to 50 latest details with logged timestamps/client IP/host field/destination IP+port. Test `--limit 10` and `--all`; only the detail display limit changes, not code counts.
+4. Inspect raw journal for hostname field equal to `[0.0.0.0]` or an IP literal: do not invent domain names in either report. Confirm excluded local management probes, out-of-window events and unparseable lines retain old counting behavior.
+5. Confirm **neither** new report writes files, changes policy, restarts any unit, resets an IP slot, alters nft quota, nor modifies any portbw/VLESS/WG setting. Re-run after reboot.
+6. The feature branch must expose **no** global/per-port website blacklist feature, no `block-add` / `block-list` / `block-del` subcommands, and no new 3proxy ACL deny rules.
 
-Scope warning: 3proxy hostname ACL matches only hostname-bearing requests. Direct IP connections can bypass domain-only rules, while a blocked IP/CIDR can affect unrelated virtual hosts. BT/P2P traffic cannot be reliably identified or prohibited solely by a domain blacklist.
+GitHub unittest passing is not sufficient for real-host acceptance, and the branch must remain unmerged until both real-host scenarios pass.
