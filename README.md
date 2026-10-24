@@ -822,6 +822,42 @@ SOCKS5 与 VLESS 使用**同一套独立 `portbw` 限速方法**，无需重复�
 
 **注意：** 如果路由器把公网端口 `51004` 映射到家宽主机的 `41004`，限速应设置在本机端口 **`41004`**，不是公网端口 `51004`。SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按本机端口管理 TCP+UDP。SOCKS5 账号创建、到期、删除均不会自动增删 `portbw` 规则；升级 `portbw` 也不会修改 SOCKS5 账号、配额和服务。已安装非本系列管理的旧版 `portbw` 的主机先参考前文“其他旧仓库/无管理记录版本的迁移”安全迁移；已有受管理版本按 `preflight-upgrade` / `upgrade` 操作。
 
+### 7. SOCKS5 访问日志审计（按本机端口查询）
+
+本功能在 3proxy 连接结束并记账时写入各端口独立的 systemd journal。**原有四项报表保持不变**；新增两个只读查询，不会修改代理、连接限制、流量配额、IP 防护、portbw 限速或 VLESS/WG 配置。
+
+```bash
+# 原有四项：完整主机域名 Top 20、来源 IP 历史 Top 20、同一分钟不同来源 IP、当前 TCP 连接
+socks5 access 40002 7
+
+# 新增：列出全部成功连接的原始主机域名及次数，不限制为前 20 名
+socks5 access-domains 40002 7
+
+# 新增：所有非零错误码的汇总次数，以及最近 50 条错误的时间/IP/目标明细
+socks5 access-errors 40002 7
+
+# 只改变错误明细显示数量；错误码统计依然覆盖全部查询时段
+socks5 access-errors 40002 7 --limit 200
+
+# 显示全部非零错误连接明细（高流量端口可能输出很长）
+socks5 access-errors 40002 7 --all
+
+# 原有的服务与防护审计命令依然可用，不等于访问日志审计
+socks5 audit 40002
+```
+
+上面 `40002` 是 **SOCKS5 本机监听端口**，不是路由器映射的公网端口；`7` 是过去 7 天，可设置为 **1～90 天**。日志时间均按**北京时间**显示。原四项只对成功连接（3proxy 返回码 `00000`）计数；域名查询只对客户端明确使用主机域名的成功代理连接计数，不合并 CNN、Google 等子域名，也不自动排除 CDN/广告域名。错误详情独立报告，不能仅凭错误码或域名推断租客恶意行为或侵权行为。
+
+只有日志开启之后、仍保存在 journald 中且已经记录的连接才能查到；未保存的历史无法补查。3proxy 日志通常在连接结束时出现，因此记录次数不是打开网页的次数；直接通过 IP 发起的连接无法反推出域名。
+
+**更新现有 SOCKS5 管理器（建议先做 VPS 快照；升级期间已有 3proxy 实例可能短暂重启）：**
+
+```bash
+AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/socks5-install.sh') update
+```
+
+初次部署请使用本节“1. 安装 / 更新”的 `install` 命令。日志采集使用每个 SOCKS5 实例自己的 journal，不改变其他端口的记录；`socks5-traffic` 每日统计和 `portbw` 限速按原章节独立管理。
+
 ## 九、V4 正式版运行规则及生产升级注意事项
 
 - **临时节点看门狗：** 连续第三次恢复失败后启动持久化的 72 小时宽限；宽限期内恢复健康，原 UUID、端口、到期时间不变，并取消倒计时。
@@ -858,62 +894,3 @@ wg show wg-exit latest-handshakes
 ---
 
 请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。
-
-## 测试分支：SOCKS5 访问日志审计（尚未通过真机验收）
-
-> 仅存在于 feature/socks5-access-audit 分支。本功能默认对所有新建账号开启；
-> 更新已有 SOCKS5 时会迁移旧账号并逐个短暂重启正在运行的旧服务。
-> **在独立测试机完成验收前，不要将其应用到生产 VPS，不要合并到 main。**
-
-**旧机升级（先做完整快照，独立测试机）：**
-
-```bash
-S5_SOURCE_REF=feature/socks5-access-audit bash <(curl -fsSL \
-  https://raw.githubusercontent.com/liucong552-art/jieshu/feature/socks5-access-audit/socks5-install.sh) update
-```
-
-**新机安装（干净 Debian 12 测试机）：**
-
-```bash
-AUTO_DEPS=1 S5_SOURCE_REF=feature/socks5-access-audit bash <(curl -fsSL \
-  https://raw.githubusercontent.com/liucong552-art/jieshu/feature/socks5-access-audit/socks5-install.sh) install
-```
-
-**按端口和时间窗口查询（与 VLESS 四项报表对齐）：**
-
-```bash
-PORT=40007
-DAYS=7
-socks5 access "$PORT" "$DAYS"
-```
-
-输出四部分：成功请求域名 Top 20、成功请求来源 IP 历史 Top 20、同一分钟出现多个来源 IP 的最新 30 条、当前已建立 TCP 连接的来源 IP。全部按北京时间显示。原有的 `socks5 audit 40007` 依然是服务/防护审计，不会被替换。
-
-日志格式由 3proxy 的 `log` 和 `logformat` 输出到每个实例的 systemd journal，未改动账号密码、ACL、IP 限制、总配额或端口限速配置。**日志从开启后才产生**；仅能统计已结束并记录的连接，直接 IP 连接不能反推出域名。journald 有自己的保存限制，查询 7 天不保证已经保存 7 天。
-
-
-
-### 仅测试分支：原始域名全量排行和错误码明细（不改变原四项统计）
-
-为避免将第三方资源误判为“主动浏览的网站”，不做域名聚合、自动分类、隐藏或过滤。原有 `socks5 access 40002 7` **四项报表原样保留**。
-
-```bash
-# 原有四项结果不变，网站排行仍是完整主机名 Top 20
-socks5 access 40002 7
-
-# 额外查看所有成功代理连接的原始主机域名排行（不是只显示前20）
-socks5 access-domains 40002 7
-
-# 错误码全量汇总 + 最新50条有来源IP/目标信息的错误详情
-socks5 access-errors 40002 7
-
-# 显示最近200条错误详情；错误码汇总始终基于整个查询时段
-socks5 access-errors 40002 7 --limit 200
-
-# 显示整个查询时段内的全部错误明细（结果可能非常长）
-socks5 access-errors 40002 7 --all
-```
-
-新命令都仅查询已有各 SOCKS5 端口的 journald 记录；不重启或更改代理、不修改原生 3proxy 日志格式、不改变连接限制、密码、ACL、IP guard、配额、portbw 或任何 VLESS/WG 规则。所有域名统计只计算 3proxy 错误码为零且客户端以域名连接的记录，直接 IP 请求无法还原域名。错误报告列出原始错误码与目标字段，不推断其一定是网站或恶意行为。仅显示实际保留且已完成记账的代理连接；过往未启用日志的历史不能补采集。
-
-完整旧机与新机真机验收步骤见 [测试门槛文档](tests/SOCKS5_AUDIT_REAL_MACHINE_ACCEPTANCE.md)。CI 通过不等于真机验收成功；main 暂不包含上述功能。
