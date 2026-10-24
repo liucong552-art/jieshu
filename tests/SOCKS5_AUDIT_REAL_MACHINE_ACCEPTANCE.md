@@ -1,6 +1,8 @@
-# SOCKS5 access-audit staging branch: real-machine gate
+# SOCKS5 access-audit: integration and real-machine regression checklist
 
-Branch: feature/socks5-access-audit. **Do not merge to main until tests on real Debian hosts pass**. A mock or GitHub Actions job does not qualify.
+The audit-only change was developed on `feature/socks5-access-audit` before integration into `main`.
+The user explicitly authorized main integration after Debian 13 staging checks; this does **not** imply that every distribution and fresh-host case below was verified.
+GitHub Actions is an offline regression gate, not a substitute for host-level testing.
 
 ## Contract
 
@@ -50,14 +52,17 @@ Create two test nodes:
 
 Repeat all access/ACL/traffic/journal isolation/reboot tests from above.
 
-## Gate to main
+## Gate to production deployment and broader compatibility
 
-Record real OS/kernel, 3proxy package and version, machine type, test time, masked evidence, tester and pass/fail for every item. Until both scenarios pass, this branch is **NOT RELEASE READY**. No merge or deployment to production is approved by this document.
+Record real OS/kernel, 3proxy package and version, machine type, test time, redacted evidence, tester and pass/fail for every item.
+Debian 13 staging checks showed preservation of existing nodes, quota, source IP guards, portbw rules, restart recovery and automatic throttling.
+The additional Debian 12 *audit upgrade* and independent clean-host checks remain useful outstanding regression coverage.
+Publishing the code in `main` at the user's request does **not** itself upgrade any running VPS or guarantee production compatibility on untested hosts; take snapshots and validate before deployment.
 
 
 ## Additional read-only reports acceptance (no blacklist features)
 
-Before any main merge, on both **old-machine upgrade** and **fresh-machine** scenarios, use real external clients and a known set of completed connections:
+For ongoing deployment qualification, on both **old-machine upgrade** and **fresh-machine** scenarios, use real external clients and a known set of completed connections:
 
 1. `socks5 access PORT 7` must print its **original four** panels with identical domain Top 20, IP counts/timestamps, same-minute events, and live TCP count as before.
 2. `socks5 access-domains PORT 7` must list **all** names in the same descending-count/lexicographic tie order as the original Top 20. First twenty pairs (name, connection count) must be byte-for-byte identical after stripping only list numbering and spacing. No domain merging, inferred TLD, third-party filtering, or cross-port leakage.
@@ -66,4 +71,4 @@ Before any main merge, on both **old-machine upgrade** and **fresh-machine** sce
 5. Confirm **neither** new report writes files, changes policy, restarts any unit, resets an IP slot, alters nft quota, nor modifies any portbw/VLESS/WG setting. Re-run after reboot.
 6. The feature branch must expose **no** global/per-port website blacklist feature, no `block-add` / `block-list` / `block-del` subcommands, and no new 3proxy ACL deny rules.
 
-GitHub unittest passing is not sufficient for real-host acceptance, and the branch must remain unmerged until both real-host scenarios pass.
+GitHub unittest passing is not sufficient for real-host acceptance; do not deploy to an untested production host without a recoverable snapshot and host-level checks.
