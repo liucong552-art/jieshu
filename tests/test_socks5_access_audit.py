@@ -228,5 +228,26 @@ class ReadOnlyAuditExtrasTests(unittest.TestCase):
         self.assertFalse(any(name.startswith("block-") for name in parser_actions))
 
 
+
+class InstallerReleaseRefTests(unittest.TestCase):
+    def test_installer_defaults_main_and_supports_explicit_staging(self):
+        installer = (ROOT / "socks5-install.sh").read_text(encoding="utf8")
+        self.assertIn('S5_SOURCE_REF="${S5_SOURCE_REF:-main}"', installer)
+        self.assertIn("main|feature/socks5-access-audit)", installer)
+        self.assertIn('RAW="https://raw.githubusercontent.com/liucong552-art/jieshu/$S5_SOURCE_REF"', installer)
+
+    def test_installer_sha256_pins_match_source_files(self):
+        import hashlib
+        installer = (ROOT / "socks5-install.sh").read_text(encoding="utf8")
+        for variable, filename in (
+            ("expected_core", "socks5.py"),
+            ("expected_traffic", "socks5-traffic.py"),
+            ("expected_audit", "socks5-audit.py")
+        ):
+            value = hashlib.sha256((ROOT / filename).read_bytes()).hexdigest()
+            self.assertIn(f'{variable}="{value}"', installer)
+
+
+
 if __name__ == "__main__":
     unittest.main()
