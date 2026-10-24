@@ -859,6 +859,38 @@ wg show wg-exit latest-handshakes
 
 请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。
 
+## SOCKS5 黑名单：全局所有端口与单独端口（仅测试分支）
+
+本功能目前只在 `feature/socks5-access-audit` 分支，**未经真机验收禁止合并 main、禁止用于生产**。继续保留已有 SOCKS5 的认证、连接并发和速率限制、IP guard、流量配额、portbw 限速及 3proxy 访问日志。
+
+操作（全局 all 包含所有旧账号以及未来创建的新账号）：
+
+```bash
+# 查看所有端口共享的全局黑名单
+socks5 block-list all
+# 添加或删除全局禁止目标（全局变更必须明确确认，可能重启所有现有端口）
+socks5 block-add all example.com --confirm
+socks5 block-del all example.com --confirm
+
+# 单独阻止端口 40002 访问 example.net 及其子域名
+socks5 block-add 40002 example.net
+socks5 block-list 40002
+socks5 block-del 40002 example.net
+
+# 也允许 IPv4 或 IPv4/CIDR 目标，例如
+socks5 block-add all 203.0.113.0/24 --confirm
+socks5 block-del all 203.0.113.0/24 --confirm
+```
+
+- 例：输入 `example.com` 会生成两项 3proxy ACL 目标：`example.com` 和 `*.example.com`，同时禁止主域与子域（连接按目标域名匹配）；严格校验规则内容，拒绝自由格式指令、空格、非预期通配符及过宽的 IPv4 段。
+- **作用范围**：全局黑名单与各端口独立黑名单取并集；移除独立规则不能绕过仍然生效的全局规则。每个端口的独立规则存于已有节点 JSON；全局规则保存在 `/etc/socks5-manager/blacklist.json`。
+- 配置在生成时按规则加入 3proxy `deny ... CONNECT`；位于 `allow CONNECT` 之前。失败请求仍可进入原始审计日志；默认日志成功请求排行只计算 3proxy 返回 0 的条目。
+- **中断风险**：每次更改端口独立黑名单需要短暂重启该端口；全局黑名单变更可能短暂重启全部运行中的 SOCKS5 端口。脚本在修改前检查配置一致性、每个节点的事务状态，并在失败时尽力恢复原配置与服务。生产使用前仍必须快照和真实测试。
+- 直接以目标 IP 请求连接会绕开纯域名规则；客户端提交的目标域名和实际传输内容不是同一回事。黑名单仅是滥用防护之一，**不能保证彻底禁止 BitTorrent 或辨认盗版内容**。
+- 3proxy 默认健康探针访问 `1.1.1.1:443`，目前禁止把覆盖该探针的 IPv4 目标加入黑名单，以免错误地触发回滚/错误告警。
+- 每份全局最多 256 项、单端口最多 128 项；超限拒绝并报错，不静默丢弃条目。
+- 本分支不提供“无断线地即时断开所有已建立连接”保证；生效以目标服务成功重启为准。
+
 ## 测试分支：SOCKS5 访问日志审计（尚未通过真机验收）
 
 > 仅存在于 feature/socks5-access-audit 分支。本功能默认对所有新建账号开启；
