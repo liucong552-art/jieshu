@@ -859,38 +859,6 @@ wg show wg-exit latest-handshakes
 
 请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。
 
-## SOCKS5 黑名单：全局所有端口与单独端口（仅测试分支）
-
-本功能目前只在 `feature/socks5-access-audit` 分支，**未经真机验收禁止合并 main、禁止用于生产**。继续保留已有 SOCKS5 的认证、连接并发和速率限制、IP guard、流量配额、portbw 限速及 3proxy 访问日志。
-
-操作（全局 all 包含所有旧账号以及未来创建的新账号）：
-
-```bash
-# 查看所有端口共享的全局黑名单
-socks5 block-list all
-# 添加或删除全局禁止目标（全局变更必须明确确认，可能重启所有现有端口）
-socks5 block-add all example.com --confirm
-socks5 block-del all example.com --confirm
-
-# 单独阻止端口 40002 访问 example.net 及其子域名
-socks5 block-add 40002 example.net
-socks5 block-list 40002
-socks5 block-del 40002 example.net
-
-# 也允许 IPv4 或 IPv4/CIDR 目标，例如
-socks5 block-add all 203.0.113.0/24 --confirm
-socks5 block-del all 203.0.113.0/24 --confirm
-```
-
-- 例：输入 `example.com` 会生成两项 3proxy ACL 目标：`example.com` 和 `*.example.com`，同时禁止主域与子域（连接按目标域名匹配）；严格校验规则内容，拒绝自由格式指令、空格、非预期通配符及过宽的 IPv4 段。
-- **作用范围**：全局黑名单与各端口独立黑名单取并集；移除独立规则不能绕过仍然生效的全局规则。每个端口的独立规则存于已有节点 JSON；全局规则保存在 `/etc/socks5-manager/blacklist.json`。
-- 配置在生成时按规则加入 3proxy `deny ... CONNECT`；位于 `allow CONNECT` 之前。失败请求仍可进入原始审计日志；默认日志成功请求排行只计算 3proxy 返回 0 的条目。
-- **中断风险**：每次更改端口独立黑名单需要短暂重启该端口；全局黑名单变更可能短暂重启全部运行中的 SOCKS5 端口。脚本在修改前检查配置一致性、每个节点的事务状态，并在失败时尽力恢复原配置与服务。生产使用前仍必须快照和真实测试。
-- 直接以目标 IP 请求连接会绕开纯域名规则；客户端提交的目标域名和实际传输内容不是同一回事。黑名单仅是滥用防护之一，**不能保证彻底禁止 BitTorrent 或辨认盗版内容**。
-- 3proxy 默认健康探针访问 `1.1.1.1:443`，目前禁止把覆盖该探针的 IPv4 目标加入黑名单，以免错误地触发回滚/错误告警。
-- 每份全局最多 256 项、单端口最多 128 项；超限拒绝并报错，不静默丢弃条目。
-- 本分支不提供“无断线地即时断开所有已建立连接”保证；生效以目标服务成功重启为准。
-
 ## 测试分支：SOCKS5 访问日志审计（尚未通过真机验收）
 
 > 仅存在于 feature/socks5-access-audit 分支。本功能默认对所有新建账号开启；
@@ -922,5 +890,30 @@ socks5 access "$PORT" "$DAYS"
 输出四部分：成功请求域名 Top 20、成功请求来源 IP 历史 Top 20、同一分钟出现多个来源 IP 的最新 30 条、当前已建立 TCP 连接的来源 IP。全部按北京时间显示。原有的 `socks5 audit 40007` 依然是服务/防护审计，不会被替换。
 
 日志格式由 3proxy 的 `log` 和 `logformat` 输出到每个实例的 systemd journal，未改动账号密码、ACL、IP 限制、总配额或端口限速配置。**日志从开启后才产生**；仅能统计已结束并记录的连接，直接 IP 连接不能反推出域名。journald 有自己的保存限制，查询 7 天不保证已经保存 7 天。
+
+
+
+### 仅测试分支：原始域名全量排行和错误码明细（不改变原四项统计）
+
+为避免将第三方资源误判为“主动浏览的网站”，不做域名聚合、自动分类、隐藏或过滤。原有 `socks5 access 40002 7` **四项报表原样保留**。
+
+```bash
+# 原有四项结果不变，网站排行仍是完整主机名 Top 20
+socks5 access 40002 7
+
+# 额外查看所有成功代理连接的原始主机域名排行（不是只显示前20）
+socks5 access-domains 40002 7
+
+# 错误码全量汇总 + 最新50条有来源IP/目标信息的错误详情
+socks5 access-errors 40002 7
+
+# 显示最近200条错误详情；错误码汇总始终基于整个查询时段
+socks5 access-errors 40002 7 --limit 200
+
+# 显示整个查询时段内的全部错误明细（结果可能非常长）
+socks5 access-errors 40002 7 --all
+```
+
+新命令都仅查询已有各 SOCKS5 端口的 journald 记录；不重启或更改代理、不修改原生 3proxy 日志格式、不改变连接限制、密码、ACL、IP guard、配额、portbw 或任何 VLESS/WG 规则。所有域名统计只计算 3proxy 错误码为零且客户端以域名连接的记录，直接 IP 请求无法还原域名。错误报告列出原始错误码与目标字段，不推断其一定是网站或恶意行为。仅显示实际保留且已完成记账的代理连接；过往未启用日志的历史不能补采集。
 
 完整旧机与新机真机验收步骤见 [测试门槛文档](tests/SOCKS5_AUDIT_REAL_MACHINE_ACCEPTANCE.md)。CI 通过不等于真机验收成功；main 暂不包含上述功能。
