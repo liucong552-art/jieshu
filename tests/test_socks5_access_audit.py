@@ -117,120 +117,115 @@ class ParserTests(unittest.TestCase):
             audit.display(40007, 7, "../evil.service", journal_lines=[])
 
 
-class BlocklistTests(unittest.TestCase):
+class ReadOnlyAuditExtrasTests(unittest.TestCase):
     def setUp(self):
-        self.node = {
-            "username": "testu", "password": "testpass", "port": 40002,
-            "maxconn": 128, "connections": 64, "id": "s5-test-2",
-            "pending": False, "pending_ip": False, "phase": "active",
-        }
-        self.settings = {"wan_if": "eth0"}
+        self.end = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        self.start = self.end - 7 * 86400
+        self.unit = "socks5-@s5-demo.service"
 
-    def test_exact_and_subdomains_and_inheritance(self):
-        config = core.proxy_config(
-            self.node, self.settings, global_rules=["example.com"])
-        self.assertIn("deny testu * example.com,*.example.com * CONNECT", config)
-        self.assertLess(config.index("example.com,*.example.com"), config.index("allow testu"))
-        self.assertIn("deny testu * * 25,465,587 CONNECT", config)
-        self.assertIn("deny testu * * * UDPASSOC,BIND", config)
-        self.assertIn("S5AUDIT", config)
-        # An independent block must not implicitly become global.
-        node_local = {**self.node, "blocklist":["another.example"]}
-        config_local = core.proxy_config(node_local,self.settings,global_rules=["example.com"])
-        self.assertIn("another.example,*.another.example",config_local)
-        self.assertNotIn("another.example,*.another.example",
-                         core.proxy_config(self.node,self.settings,global_rules=["example.com"]))
+    def record(self, hostname="news.example.com", *, err=0, ip="38.244.61.82", stamp=None):
+        stamp = self.end - 30 if stamp is None else stamp
+        return f"{stamp} S5AUDIT {err:05d} {ip} 44001 {hostname} 93.184.215.14 443 12 34"
 
-    def test_no_rules_equals_original_config(self):
-        original = core.proxy_config(self.node, self.settings, access_log=True,global_rules=[])
-        self.assertNotIn("example.com",original)
-        self.assertNotIn("blocklist",original)
+    def test_old_top20_matches_full_report_identically(self):
+        records = []
+        for i in range(32):
+            records.extend([self.record(f"d{i:02d}.example.com")] * (i + 1))
+        records.append(self.record("hidden.example.com", err=10))
+        records.append(self.record("8.8.8.8"))
+        old = io.StringIO()
+        new = io.StringIO()
+        with contextlib.redirect_stdout(old):
+            audit.display(40007, 7, self.unit, journal_lines=records, ss_snapshot={})
+        with contextlib.redirect_stdout(new):
+            audit.display_all_domains(40007, 7, self.unit, journal_lines=records)
+        self.assertIn("【1 / 4 网站访问排行：最多前 20 名】", old.getvalue())
+        old_top = old.getvalue().split("【1 / 4 网站访问排行：最多前 20 名】")[1].split("【2 / 4")[0]
+        all_text = new.getvalue()
+        self.assertIn("域名总数：32 个；有域名的成功连接：528 次。", all_text)
+        for i in range(32):
+            self.assertIn(f"d{i:02d}.example.com", all_text)
+        self.assertNotIn("hidden.example.com", all_text)
+        self.assertNotIn("8.8.8.8", all_text)
+        # Every original ranked entry is present with exactly the same count.
+        import re
+        top_pairs = re.findall(r"\d+\.\s+(d\d\d\.example\.com)\s+(\d+) 次连接", old_top)
+        full_pairs = re.findall(r"\d+\.\s+(d\d\d\.example\.com)\s+(\d+) 次连接", all_text)
+        self.assertEqual(top_pairs,full_pairs[:20])
 
-    def test_ip_and_cidr_and_rejected_input(self):
-        self.assertEqual(core.black_target("192.0.2.0/24"),"192.0.2.0/24")
-        self.assertEqual(core.block_acl_targets("198.51.100.12"),"198.51.100.12")
-        for unsafe in ("*", "*.example.com", "test.com\nallow *",
-                       "example.com *", "abc;deny", "http://example.com",
-                       "1.1.1.1", "1.0.0.0/8", "0.0.0.0/0",
-                       "example.com,example.net", "evil..com",
-                       "1234", "foo/bar"):
-            with self.subTest(unsafe=unsafe):
-                with self.assertRaises(core.Fail):
-                    core.black_target(unsafe)
+    def test_exact_error_code_counts_for_real_test_pattern(self):
+        records = (
+            [self.record("mail.google.com",err=10) for _ in range(28)] +
+            [self.record("cachefly.cachefly.net",err=95)] +
+            [self.record("[0.0.0.0]",err=100) for _ in range(2)] +
+            [self.record("edition.cnn.com") for _ in range(98)] +
+            ["junk S5AUDIT broken"]
+        )
+        codes, entries, valid, invalid = audit.collect_error_details(
+            records,self.start,self.end,limit=10)
+        self.assertEqual(codes,{10:28,95:1,100:2})
+        self.assertEqual((valid,invalid), (129,1))
+        self.assertEqual(len(entries),10)
+        self.assertEqual(sum(codes.values()),31)
+        full = io.StringIO()
+        with contextlib.redirect_stdout(full):
+            audit.display_error_details(40007,7,self.unit,journal_lines=records,limit=10)
+        result=full.getvalue()
+        for fragment in ("错误码=00010 | 28 次", "错误码=00095 | 1 次",
+                         "错误码=00100 | 2 次", "显示 10 / 31 条",
+                         "成功 98、错误码非零 31、不完整 1",
+                         "socks5 access-errors 40007 7 --all"):
+            self.assertIn(fragment,result)
+        self.assertNotIn("目标主机=edition.cnn.com",result)
 
-    def test_duplicate_and_limit(self):
-        with self.assertRaises(core.Fail):
-            core.checked_blocks(["example.com","example.com"],5)
-        with self.assertRaises(core.Fail):
-            core.checked_blocks(["one.example","two.example"],1)
-        with self.assertRaises(core.Fail):
-            core.black_change(["example.com"],"block-add","EXAMPLE.COM",3)
+    def test_all_errors_are_shown_newest_first(self):
+        records=[
+            self.record("past.example.com",err=10,stamp=self.end-30),
+            self.record("[0.0.0.0]",err=100,stamp=self.end-10),
+            self.record("recent.example.com",err=95,stamp=self.end-20),
+            self.record("pass.example.com",err=0,stamp=self.end-1)
+        ]
+        buffer=io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            audit.display_error_details(40007,7,self.unit,journal_lines=records,limit=None)
+        output=buffer.getvalue()
+        self.assertIn("显示 3 / 3 条",output)
+        self.assertNotIn("pass.example.com",output)
+        self.assertLess(output.index("目标主机=[0.0.0.0]"),output.index("目标主机=recent.example.com"))
+        self.assertLess(output.index("目标主机=recent.example.com"),output.index("目标主机=past.example.com"))
+        self.assertIn("（非有效域名）",output)
+        self.assertIn("目标IP=93.184.215.14 | 目标端口=443",output)
+        self.assertIn("来源IP=38.244.61.82",output)
 
-    def test_parser_scopes(self):
-        x=core.parser().parse_args(["block-add","all","example.com","--confirm"])
-        self.assertEqual((x.scope,x.target,x.confirm),("all","example.com",True))
-        y=core.parser().parse_args(["block-list","40002"])
-        self.assertEqual(y.scope,"40002")
+    def test_new_commands_are_only_read_reports(self):
+        a=core.parser().parse_args(["access-domains","40002","7"])
+        b=core.parser().parse_args(["access-errors","40002","7","--limit","40"])
+        c=core.parser().parse_args(["access-errors","40002","7","--all"])
+        self.assertEqual((a.action,a.port,a.days),("access-domains","40002","7"))
+        self.assertEqual((b.action,b.limit,b.all),("access-errors","40",False))
+        self.assertTrue(c.all)
 
-    def test_global_add_and_remove_keep_other_rules(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            from pathlib import Path
-            config=Path(tmp)/"s5-test-2.cfg"
-            blacklist=Path(tmp)/"blacklist.json"
-            base=core.proxy_config(self.node,self.settings,global_rules=[]).encode()
-            config.write_bytes(base)
-            calls=[]
-            def fake_systemctl(*parts,**kwargs):
-                if parts[0]=="is-active":return "active"
-                calls.append(tuple(parts))
-                return "ok"
-            with mock.patch.object(core,"BLACKLIST_PATH",blacklist), \
-                 mock.patch.object(core,"nodes",return_value=[self.node]), \
-                 mock.patch.object(core,"settings",return_value=self.settings), \
-                 mock.patch.object(core,"proxycfg",return_value=config), \
-                 mock.patch.object(core,"systemctl",side_effect=fake_systemctl), \
-                 mock.patch.object(core,"socks_handshake"):
-                core.change_global_blocks("block-add","example.com")
-                self.assertIn("*.example.com",config.read_text())
-                self.assertIn("example.com",core.global_blocks())
-                self.assertEqual(len(calls),1)
-                core.change_global_blocks("block-del","example.com")
-                self.assertEqual(config.read_bytes(),base)
-                self.assertEqual(core.global_blocks(),[])
-                self.assertEqual(len(calls),2)
+    def test_new_reports_validate_ranges(self):
+        with self.assertRaises(ValueError):
+            audit.display_all_domains(40007, 0, self.unit, journal_lines=[])
+        with self.assertRaises(ValueError):
+            audit.display_error_details(40007,7,"../bad.service",journal_lines=[])
+        with self.assertRaises(ValueError):
+            audit.collect_error_details([],self.start,self.end,limit=0)
+        with self.assertRaises(ValueError):
+            audit.display_error_details(40007,7,self.unit,journal_lines=[],limit=-1)
 
-    def test_global_failure_rolls_back_all_configs(self):
-        import tempfile
-        from pathlib import Path
-        with tempfile.TemporaryDirectory() as tmp:
-            blacklist=Path(tmp)/"blacklist.json"
-            configs={}
-            nodes=[self.node,{**self.node,"id":"s5-test-3","port":40003,"username":"u3"}]
-            originals={}
-            for n in nodes:
-                config=Path(tmp)/(n["id"]+".cfg")
-                b=core.proxy_config(n,self.settings,global_rules=[]).encode()
-                config.write_bytes(b);configs[n["id"]]=config;originals[n["id"]]=b
-            steps=[0]
-            def control(*parts,**kwargs):
-                if parts[0]=="is-active":return "active"
-                if parts[0]=="restart":
-                    steps[0]+=1
-                    if steps[0]==2:raise core.Fail("test failure during second restart")
-                return "ok"
-            with mock.patch.object(core,"BLACKLIST_PATH",blacklist), \
-                 mock.patch.object(core,"nodes",return_value=nodes), \
-                 mock.patch.object(core,"settings",return_value=self.settings), \
-                 mock.patch.object(core,"proxycfg",side_effect=lambda id: configs[id]), \
-                 mock.patch.object(core,"systemctl",side_effect=control), \
-                 mock.patch.object(core,"socks_handshake"):
-                with self.assertRaises(core.Fail):
-                    core.change_global_blocks("block-add","example.com")
-                self.assertFalse(blacklist.exists())
-                for n in nodes:
-                    self.assertEqual(configs[n["id"]].read_bytes(),originals[n["id"]])
-                self.assertGreaterEqual(steps[0],4)
+    def test_original_proxy_acl_and_logging_stay_unchanged(self):
+        node={"username":"u123","password":"p123","port":40007,"connections":64,"maxconn":128}
+        config=core.proxy_config(node,{"wan_if":"eth0"})
+        self.assertIn("connlim 64 0 u123",config)
+        self.assertIn("connlim 120 60 u123",config)
+        self.assertIn("deny u123 * * 25,465,587 CONNECT",config)
+        self.assertIn("deny u123 * * * UDPASSOC,BIND",config)
+        self.assertIn("S5AUDIT",config)
+        self.assertNotIn("example.com",config)
+        parser_actions=core.parser()._subparsers._group_actions[0].choices
+        self.assertFalse(any(name.startswith("block-") for name in parser_actions))
 
 
 if __name__ == "__main__":
