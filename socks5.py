@@ -603,176 +603,7 @@ def quota_reset(n,now=None):
     except Fail:ensure_block(n);raise
     n['pending']=False;atomic_json(nodefile(n['id']),n);return True
 
-
-# Global rules apply to every existing node and are inherited by future nodes.
-# Per-node rules live inside the existing durable node state. Accept only
-# simple, injection-proof domain and IPv4/CIDR targets, never raw 3proxy ACLs.
-BLACKLIST_PATH = CONF/'blacklist.json'
-MAX_GLOBAL_BLOCKS, MAX_NODE_BLOCKS = 256, 128
-
-
-def black_target(value):
-    if not isinstance(value,str):
-        raise Fail('黑名单目标必须是字符串')
-    v=value.strip().lower().rstrip('.')
-    if v != value.strip().lower() and v.endswith('.'):
-        raise Fail('域名格式不正确')
-    if len(v)>253 or not v or any(c in v for c in ',* \t\r\n/\\\"\'$#;'):
-        # A slash is only allowed as part of an IPv4 CIDR, below.
-        if '/' not in v or any(c in v for c in ',* \t\r\n\\\"\'$#;'):
-            raise Fail('只接受完整域名或 IPv4/CIDR，不接受通配符或 3proxy 配置表达式')
-    if '/' in v or re.fullmatch(r'[0-9.]+',v):
-        try:
-            if '/' in v:
-                net=ipaddress.IPv4Network(v,strict=True)
-                if net.prefixlen < 8:
-                    raise Fail('拒绝过宽的 IPv4 网段（前缀长度必须至少 /8）')
-                if ipaddress.ip_address('1.1.1.1') in net:
-                    raise Fail('1.1.1.1 为现有代理健康检测目标，禁止加入黑名单')
-                return str(net)
-            ip=ipaddress.IPv4Address(v)
-            if str(ip)=='1.1.1.1':
-                raise Fail('1.1.1.1 为现有代理健康检测目标，禁止加入黑名单')
-            return str(ip)
-        except ValueError as e:
-            raise Fail('IPv4 / CIDR 格式无效') from e
-    if len(v)>253:
-        raise Fail('域名超过 253 字符')
-    labels=v.split('.')
-    if len(labels)<2 or any(
-        len(part)>63 or not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',part)
-        for part in labels
-    ) or labels[-1].isdigit():
-        raise Fail('域名无效，请使用 example.com（自动匹配子域名）')
-    return v
-
-
-def checked_blocks(values,limit):
-    if not isinstance(values,list) or len(values)>limit:
-        raise Fail('黑名单列表类型或数量超限')
-    result=[black_target(v) for v in values]
-    if len(result)!=len(set(result)):
-        raise Fail('黑名单中存在重复目标')
-    return sorted(result)
-
-
-def global_blocks():
-    data=load(BLACKLIST_PATH,default={'rules':[]})
-    if not isinstance(data,dict) or set(data)!={'rules'}:
-        raise Fail('全局黑名单文件格式损坏')
-    return checked_blocks(data['rules'],MAX_GLOBAL_BLOCKS)
-
-
-def local_blocks(n):
-    return checked_blocks(n.get('blocklist',[]),MAX_NODE_BLOCKS)
-
-
-def block_acl_targets(value):
-    value=black_target(value)
-    if re.fullmatch(r'[0-9.]+(?:/[0-9]+)?',value):
-        return value
-    return value+',*.'+value
-
-
-def black_change(values,verb,item,limit):
-    item=black_target(item)
-    result=set(checked_blocks(values,limit))
-    if verb=='block-add':
-        if item in result:raise Fail(f'黑名单已包含 {item}，没有执行更改')
-        result.add(item)
-    else:
-        if item not in result:raise Fail(f'黑名单不存在 {item}，没有执行更改')
-        result.remove(item)
-    return checked_blocks(sorted(result),limit)
-
-
-def show_blocks(ref):
-    global_list=global_blocks()
-    if ref=='all':
-        print('全局黑名单：作用于所有已有 SOCKS5 端口和今后新建端口')
-        for entry in global_list:print('  '+entry)
-        if not global_list:print('  （空）')
-        return
-    n=resolve_node(ref)
-    local_list=local_blocks(n)
-    print(f'端口 {n["port"]} | 全局黑名单 {len(global_list)} 项 | 独立黑名单 {len(local_list)} 项')
-    print('【继承自全局】')
-    for entry in global_list:print('  '+entry)
-    if not global_list:print('  （空）')
-    print('【该端口独立】')
-    for entry in local_list:print('  '+entry)
-    if not local_list:print('  （空）')
-    print('规则取并集；删除独立项不会删除全局规则。')
-    try:
-        verify_proxycfg(n)
-        print('已生成的配置与黑名单状态一致：是')
-    except Fail:
-        print('已生成的配置与黑名单状态一致：否（需要排查）')
-
-
-def change_global_blocks(verb,item):
-    """Transactional global ACL update; never touch nftables/quotas/IP slots."""
-    before=global_blocks()
-    after=black_change(before,verb,item,MAX_GLOBAL_BLOCKS)
-    settings_now=settings()
-    all_nodes=nodes()
-    configs={}
-    live={}
-    # Full preflight before updating persistent policy or interrupting ports.
-    for n in all_nodes:
-        if n.get('pending') or n.get('pending_ip') or n.get('phase')=='creating':
-            raise Fail(f'端口 {n["port"]} 存在未结束事务，不允许全局改动')
-        cfg=proxycfg(n['id'])
-        if cfg.is_symlink() or not cfg.is_file():
-            raise Fail(f'端口 {n["port"]} 的配置文件缺失或类型不安全')
-        previous=cfg.read_bytes()
-        if previous!=proxy_config(n,settings_now,global_rules=before).encode():
-            raise Fail(f'端口 {n["port"]} 配置与状态不一致，拒绝执行全局更改')
-        target=proxy_config(n,settings_now,global_rules=after).encode()
-        configs[n['id']]=(cfg,previous,target)
-        live[n['id']]=systemctl('is-active','--quiet',service(n),required=False) is not None
-    original_exists=BLACKLIST_PATH.exists()
-    original_bytes=BLACKLIST_PATH.read_bytes() if original_exists else None
-    if BLACKLIST_PATH.is_symlink():
-        raise Fail('拒绝写入全局黑名单符号链接')
-    changed=[]
-    try:
-        atomic_json(BLACKLIST_PATH,{'rules':after})
-        for n in all_nodes:
-            cfg,previous,target=configs[n['id']]
-            if previous==target:continue
-            # Record the node before writing/restarting so rollback includes
-            # failures during either stage.
-            changed.append(n)
-            atomic_write(cfg,target)
-            if live[n['id']]:
-                systemctl('restart',service(n))
-                socks_handshake(n)
-    except Exception as e:
-        failed=[]
-        try:
-            if original_bytes is None:BLACKLIST_PATH.unlink(missing_ok=True)
-            else:atomic_write(BLACKLIST_PATH,original_bytes)
-        except Exception as ex:
-            failed.append(f'全局黑名单状态: {ex}')
-        # Restore all original files before restarting any original service.
-        for n in changed:
-            cfg,previous,_=configs[n['id']]
-            try:atomic_write(cfg,previous)
-            except Exception as ex:failed.append(f'{n["port"]} 配置: {ex}')
-        for n in changed:
-            if live[n['id']]:
-                try:systemctl('restart',service(n))
-                except Exception as ex:failed.append(f'{n["port"]} 重启: {ex}')
-        if failed:
-            raise Fail('全局规则更新失败，回滚未完全成功；请立即检查所有端口：'+
-                       '；'.join(failed)) from e
-        raise Fail('全局规则更新失败，已尝试恢复全部旧规则与服务：'+str(e)) from e
-    print(f'全局黑名单已更新，影响现有账号 {len(all_nodes)} 个；配置变更重启 {sum(1 for n in changed if live[n["id"]])} 个运行端口。')
-    print('今后新增 SOCKS5 端口自动继承此全局黑名单。')
-
-
-def proxy_config(n,s,*,access_log=True,global_rules=None):
+def proxy_config(n,s,*,access_log=True):
     u=n['username'];pwd=n['password'];p=n['port'];wan=s['wan_if']
     # chars are deliberately restricted: passwords contain no $, whitespace, \n or ':'
     lines=['# Generated by socks5-manager. Do not edit manually.',
@@ -785,12 +616,6 @@ def proxy_config(n,s,*,access_log=True,global_rules=None):
         # %t epoch | marker | error | client IP/port | hostname | target IP/port | bytes
         # '- +_' sanitizes user-supplied spaces as recommended by 3proxy docs.
         lines.extend(['log', 'logformat "- +_G%t S5AUDIT %E %C %c %n %R %r %I %O"'])
-    # Preserve the built-in fail-closed ACLs, then apply both deny lists
-    # before the first 'allow CONNECT' statement.
-    shared = global_blocks() if global_rules is None else checked_blocks(global_rules,MAX_GLOBAL_BLOCKS)
-    unique = local_blocks(n)
-    for entry in sorted(set(shared+unique)):
-        lines.append(f'deny {u} * {block_acl_targets(entry)} * CONNECT')
     # Restrict both requested private addresses and hostnames that resolve to private IPs.
     lines.append(f'deny {u} * {",".join(BLOCKED)} * CONNECT')
     # SMTP abuse mitigation.
@@ -1515,20 +1340,17 @@ def operate(args):
     action=args.action
     if action=='install':return do_install(args)
     if action=='add':return do_add(args)
-    if action in ('block-list','block-add','block-del'):
+    if action in ('access-domains','access-errors'):
         with locked():
-            if action=='block-list':
-                return show_blocks(args.scope)
-            if args.scope=='all':
-                if not args.confirm:
-                    raise Fail('全局黑名单更改影响所有端口，必须加 --confirm')
-                return change_global_blocks(action,args.target)
-            n=resolve_node(args.scope)
-            revised=black_change(local_blocks(n),action,args.target,MAX_NODE_BLOCKS)
-            # Uses the existing durable transaction/rollback and handshake.
-            do_mutate(n,{'blocklist':revised},rebuild_cfg=True)
-            print(f'端口 {n["port"]} 独立黑名单已更新，仅重启此端口。')
-        return
+            chosen=resolve_node(args.port)
+            unit=service(chosen)
+            port=chosen['port']
+        from audit import display_all_domains, display_error_details
+        days=num(args.days,'DAYS',1,90)
+        if action=='access-domains':
+            return display_all_domains(port,days,unit)
+        limit=None if args.all else num(args.limit,'LIMIT',1,10000)
+        return display_error_details(port,days,unit,limit=limit)
     if action=='access':
         with locked():
             chosen = resolve_node(args.port)
@@ -1743,13 +1565,13 @@ def parser():
     p.add_argument('--max-start-retries',default=os.getenv('MAX_START_RETRIES','12'))
     for name in ('status','save','gc','reset','watch','restore','ddns-check','ddns-status'):sub.add_parser(name)
     sub.add_parser('list')
-    for action_name in ('block-add','block-del','block-list'):
-        p=sub.add_parser(action_name,help='全局 all 或独立 SOCKS5 端口的目标黑名单')
-        p.add_argument('scope',help='all=全部端口（含未来新增）或具体端口号')
-        if action_name != 'block-list':
-            p.add_argument('target',help='完整域名（含子域名）或 IPv4/CIDR')
-            p.add_argument('--confirm',action='store_true',
-                           help='全局更新必须提供，确认可能重启全部 SOCKS5 端口')
+    for report_name in ('access-domains','access-errors'):
+        p=sub.add_parser(report_name,help=('查看全部成功请求的原始域名排行' if report_name=='access-domains' else '按错误码汇总和查看连接错误明细'))
+        p.add_argument('port',help='SOCKS5 本机端口')
+        p.add_argument('days',nargs='?',default='7',help='过去天数，1～90，默认7')
+        if report_name=='access-errors':
+            p.add_argument('--limit',default='50',help='显示最近错误详情的条数，1～10000，默认50')
+            p.add_argument('--all',action='store_true',help='显示时间段内全部错误明细')
     p=sub.add_parser('access',help='查看 3proxy 访问审计四项报表')
     p.add_argument('port',help='SOCKS5 本机端口')
     p.add_argument('days',nargs='?',default='7',help='过去天数，1～90，默认7')
