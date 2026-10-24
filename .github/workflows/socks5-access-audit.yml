@@ -18,7 +18,7 @@ jobs:
           python3 -m py_compile socks5.py socks5-traffic.py socks5-audit.py
           bash -n socks5-install.sh
           python3 -m unittest discover -s tests -p test_socks5_access_audit.py -v
-      - name: Reminder: offline CI is not all-platform acceptance
+      - name: Offline CI does not replace host acceptance
         run: |
           echo 'Offline CI succeeded or failed independently of required real-host tests.'
           echo 'Production installation still requires host-level safety checks and snapshots.'
