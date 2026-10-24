@@ -117,5 +117,121 @@ class ParserTests(unittest.TestCase):
             audit.display(40007, 7, "../evil.service", journal_lines=[])
 
 
+class BlocklistTests(unittest.TestCase):
+    def setUp(self):
+        self.node = {
+            "username": "testu", "password": "testpass", "port": 40002,
+            "maxconn": 128, "connections": 64, "id": "s5-test-2",
+            "pending": False, "pending_ip": False, "phase": "active",
+        }
+        self.settings = {"wan_if": "eth0"}
+
+    def test_exact_and_subdomains_and_inheritance(self):
+        config = core.proxy_config(
+            self.node, self.settings, global_rules=["example.com"])
+        self.assertIn("deny testu * example.com,*.example.com * CONNECT", config)
+        self.assertLess(config.index("example.com,*.example.com"), config.index("allow testu"))
+        self.assertIn("deny testu * * 25,465,587 CONNECT", config)
+        self.assertIn("deny testu * * * UDPASSOC,BIND", config)
+        self.assertIn("S5AUDIT", config)
+        # An independent block must not implicitly become global.
+        node_local = {**self.node, "blocklist":["another.example"]}
+        config_local = core.proxy_config(node_local,self.settings,global_rules=["example.com"])
+        self.assertIn("another.example,*.another.example",config_local)
+        self.assertNotIn("another.example,*.another.example",
+                         core.proxy_config(self.node,self.settings,global_rules=["example.com"]))
+
+    def test_no_rules_equals_original_config(self):
+        original = core.proxy_config(self.node, self.settings, access_log=True,global_rules=[])
+        self.assertNotIn("example.com",original)
+        self.assertNotIn("blocklist",original)
+
+    def test_ip_and_cidr_and_rejected_input(self):
+        self.assertEqual(core.black_target("192.0.2.0/24"),"192.0.2.0/24")
+        self.assertEqual(core.block_acl_targets("198.51.100.12"),"198.51.100.12")
+        for unsafe in ("*", "*.example.com", "test.com\nallow *",
+                       "example.com *", "abc;deny", "http://example.com",
+                       "1.1.1.1", "1.0.0.0/8", "0.0.0.0/0",
+                       "example.com,example.net", "evil..com",
+                       "1234", "foo/bar"):
+            with self.subTest(unsafe=unsafe):
+                with self.assertRaises(core.Fail):
+                    core.black_target(unsafe)
+
+    def test_duplicate_and_limit(self):
+        with self.assertRaises(core.Fail):
+            core.checked_blocks(["example.com","example.com"],5)
+        with self.assertRaises(core.Fail):
+            core.checked_blocks(["one.example","two.example"],1)
+        with self.assertRaises(core.Fail):
+            core.black_change(["example.com"],"block-add","EXAMPLE.COM",3)
+
+    def test_parser_scopes(self):
+        x=core.parser().parse_args(["block-add","all","example.com","--confirm"])
+        self.assertEqual((x.scope,x.target,x.confirm),("all","example.com",True))
+        y=core.parser().parse_args(["block-list","40002"])
+        self.assertEqual(y.scope,"40002")
+
+    def test_global_add_and_remove_keep_other_rules(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            from pathlib import Path
+            config=Path(tmp)/"s5-test-2.cfg"
+            blacklist=Path(tmp)/"blacklist.json"
+            base=core.proxy_config(self.node,self.settings,global_rules=[]).encode()
+            config.write_bytes(base)
+            calls=[]
+            def fake_systemctl(*parts,**kwargs):
+                if parts[0]=="is-active":return "active"
+                calls.append(tuple(parts))
+                return "ok"
+            with mock.patch.object(core,"BLACKLIST_PATH",blacklist), \
+                 mock.patch.object(core,"nodes",return_value=[self.node]), \
+                 mock.patch.object(core,"settings",return_value=self.settings), \
+                 mock.patch.object(core,"proxycfg",return_value=config), \
+                 mock.patch.object(core,"systemctl",side_effect=fake_systemctl), \
+                 mock.patch.object(core,"socks_handshake"):
+                core.change_global_blocks("block-add","example.com")
+                self.assertIn("*.example.com",config.read_text())
+                self.assertIn("example.com",core.global_blocks())
+                self.assertEqual(len(calls),1)
+                core.change_global_blocks("block-del","example.com")
+                self.assertEqual(config.read_bytes(),base)
+                self.assertEqual(core.global_blocks(),[])
+                self.assertEqual(len(calls),2)
+
+    def test_global_failure_rolls_back_all_configs(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            blacklist=Path(tmp)/"blacklist.json"
+            configs={}
+            nodes=[self.node,{**self.node,"id":"s5-test-3","port":40003,"username":"u3"}]
+            originals={}
+            for n in nodes:
+                config=Path(tmp)/(n["id"]+".cfg")
+                b=core.proxy_config(n,self.settings,global_rules=[]).encode()
+                config.write_bytes(b);configs[n["id"]]=config;originals[n["id"]]=b
+            steps=[0]
+            def control(*parts,**kwargs):
+                if parts[0]=="is-active":return "active"
+                if parts[0]=="restart":
+                    steps[0]+=1
+                    if steps[0]==2:raise core.Fail("test failure during second restart")
+                return "ok"
+            with mock.patch.object(core,"BLACKLIST_PATH",blacklist), \
+                 mock.patch.object(core,"nodes",return_value=nodes), \
+                 mock.patch.object(core,"settings",return_value=self.settings), \
+                 mock.patch.object(core,"proxycfg",side_effect=lambda id: configs[id]), \
+                 mock.patch.object(core,"systemctl",side_effect=control), \
+                 mock.patch.object(core,"socks_handshake"):
+                with self.assertRaises(core.Fail):
+                    core.change_global_blocks("block-add","example.com")
+                self.assertFalse(blacklist.exists())
+                for n in nodes:
+                    self.assertEqual(configs[n["id"]].read_bytes(),originals[n["id"]])
+                self.assertGreaterEqual(steps[0],4)
+
+
 if __name__ == "__main__":
     unittest.main()
