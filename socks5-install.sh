@@ -37,7 +37,7 @@ if [[ "$ACTION" != deps ]];then
     SRC_DIR="$FETCH_DIR"
     echo "[socks5] 从 jieshu/$S5_SOURCE_REF 下载三个 SOCKS5 模块..."
   fi
-  expected_core="cda9f47a10aa8e15fd101ba94b00ce34e3a85378dadcd8d303e0487ffe797b18"
+  expected_core="9f078da4adade60c69b4ac9f0174e9b70149ad603a7f768da7cbaa9563c18cdb"
   expected_traffic="134bcd2a2ee8947bcad3bad09c6f0d50ea5474249701758c514a2294274deb23"
   expected_audit="f33c774a2c5973ebe28e36e01f66906363dbecda3f6895c8629d11b76b60be82"
   actual_audit="$(sha256sum "$SRC_DIR/socks5-audit.py" | awk '{print $1}')"
