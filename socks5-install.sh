@@ -11,7 +11,7 @@ case "$ACTION" in
   *) echo '用法：bash socks5-install.sh install --wan-if eth0 --host 1.2.3.4 | update | deps' >&2;exit 2;;
 esac
 
-# Sources may be next to the local installer, or fetched from jieshu/main.
+# Sources may be local or fetched from a selected jieshu release branch.
 # SHA256 pinning prevents mixing a new installer with an old manager.
 FETCH_DIR=''
 fetch_cleanup(){
@@ -19,22 +19,31 @@ fetch_cleanup(){
 }
 trap fetch_cleanup EXIT
 if [[ "$ACTION" != deps ]];then
-  if [[ -f "$DIR/socks5.py" && -f "$DIR/socks5-traffic.py" ]];then
+  if [[ -f "$DIR/socks5.py" && -f "$DIR/socks5-traffic.py" && -f "$DIR/socks5-audit.py" ]];then
     SRC_DIR="$DIR"
   else
     command -v curl >/dev/null || { echo '缺少 curl；请先安装 curl ca-certificates' >&2;exit 1; }
     FETCH_DIR="$(mktemp -d /tmp/socks5-source.XXXXXXXX)"
     chmod 0700 "$FETCH_DIR"
-    RAW='https://raw.githubusercontent.com/liucong552-art/jieshu/main'
+    S5_SOURCE_REF="${S5_SOURCE_REF:-main}"
+    case "$S5_SOURCE_REF" in
+      main|feature/socks5-access-audit) ;;
+      *) echo '拒绝未知源码分支，请使用 main 或 feature/socks5-access-audit' >&2; exit 1 ;;
+    esac
+    RAW="https://raw.githubusercontent.com/liucong552-art/jieshu/$S5_SOURCE_REF"
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5.py" -o "$FETCH_DIR/socks5.py"
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5-traffic.py" -o "$FETCH_DIR/socks5-traffic.py"
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 90 "$RAW/socks5-audit.py" -o "$FETCH_DIR/socks5-audit.py"
     SRC_DIR="$FETCH_DIR"
-    echo '[socks5] 从 jieshu/main 下载 SOCKS5 两个主体文件...'
+    echo "[socks5] 从 jieshu/$S5_SOURCE_REF 下载三个 SOCKS5 模块..."
   fi
-  expected_core="13989ec8cb103a5d34141b32b41bc6f7d98e27ce13f2bb003b9dbcc94b342aa8"
+  expected_core="4c6d97e82749973d17274d96dc3f3cf828ca357638fcc6019c487ba3f49a3dcf"
   expected_traffic="134bcd2a2ee8947bcad3bad09c6f0d50ea5474249701758c514a2294274deb23"
+  expected_audit="3c6e1bb357959e12d04c9adf2ba0a99f51ca349c4b812f8b6981259843acf7c8"
+  actual_audit="$(sha256sum "$SRC_DIR/socks5-audit.py" | awk '{print $1}')"
   actual_core="$(sha256sum "$SRC_DIR/socks5.py" | awk '{print $1}')"
   actual_traffic="$(sha256sum "$SRC_DIR/socks5-traffic.py" | awk '{print $1}')"
+  [[ "$actual_audit" == "$expected_audit" ]] || { echo 'socks5-audit.py SHA256 不匹配；停止安装' >&2;exit 1; }
   [[ "$actual_core" == "$expected_core" ]] || { echo 'socks5.py SHA256 不匹配；停止安装' >&2;exit 1; }
   [[ "$actual_traffic" == "$expected_traffic" ]] || { echo 'socks5-traffic.py SHA256 不匹配；停止安装' >&2;exit 1; }
   echo '[socks5] SHA256 校验通过'
@@ -72,7 +81,7 @@ fi
 for name in 3proxy python3 nft ip ss timeout systemctl flock;do
   command -v "$name" >/dev/null || { echo "缺少 $name；运行 AUTO_DEPS=1 bash socks5-install.sh install ..." >&2;exit 1; }
 done
-python3 -B - "$SRC_DIR/socks5.py" "$SRC_DIR/socks5-traffic.py" <<'PY'
+python3 -B - "$SRC_DIR/socks5.py" "$SRC_DIR/socks5-traffic.py" "$SRC_DIR/socks5-audit.py" <<'PY'
 import sys
 for name in sys.argv[1:]:
     with open(name,'rb') as f:compile(f.read(),name,'exec')
@@ -81,7 +90,7 @@ install -d -m 0755 /usr/local/lib/socks5-manager /usr/local/sbin
 install -d -m 0700 /run/socks5-manager
 exec 9>/run/socks5-manager/install.lock
 flock -w 120 9 || { echo 'SOCKS5 安装锁繁忙' >&2;exit 1; }
-TARGETS=(/usr/local/lib/socks5-manager/socks5.py /usr/local/lib/socks5-manager/traffic.py /usr/local/sbin/socks5 /usr/local/sbin/socks5-traffic)
+TARGETS=(/usr/local/lib/socks5-manager/socks5.py /usr/local/lib/socks5-manager/traffic.py /usr/local/lib/socks5-manager/audit.py /usr/local/sbin/socks5 /usr/local/sbin/socks5-traffic)
 SUCCESS=0
 TX="$(mktemp -d /var/tmp/socks5-install.XXXXXX)"
 cleanup(){
@@ -128,6 +137,7 @@ atomic_install(){
 }
 atomic_install "$SRC_DIR/socks5.py" /usr/local/lib/socks5-manager/socks5.py 0700
 atomic_install "$SRC_DIR/socks5-traffic.py" /usr/local/lib/socks5-manager/traffic.py 0700
+atomic_install "$SRC_DIR/socks5-audit.py" /usr/local/lib/socks5-manager/audit.py 0700
 cat >"$TX/socks5.wrapper" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
