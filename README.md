@@ -970,3 +970,29 @@ fi
 **无残留说明：** 解除封禁会删除这个端口专属的 nftables 表以及其中全部链和规则，不产生本功能的配置文件、定时任务或后台进程。命令本身仍可能留在 Bash history；已有 TCP 连接在内核中的状态、系统日志不会因此自动清除。
 
 **注意：** 本功能只检查其专属临时规则，不能替代外部网络连通性测试。解除后若还有其他防火墙规则，端口仍可能无法访问；封禁时服务显示 `active`、端口显示 `LISTEN` 是正常的。临时规则不设到期时间，通常在重启或防火墙规则重载后失效。若端口存在之前创建的旧版 IPv4-only 临时表，第 1 条不会擅自覆盖；先用第 2 条删除旧表，再执行第 1 条重新封禁即可。
+
+## 十一、指定端口按来源 IP 永久拉黑 / 解封（支持批量）
+
+在**需要封禁的 Debian 12 服务器**上以 root 身份执行。**不需要首次初始化或安装**。每次只改命令最前面的 `P=40001`（端口）和 `IPS="..."`（来源 IPv4，多 IP 用空格分隔）。只封一个 IP 时也使用同一命令，例如 `IPS="1.2.3.4"`。依赖系统现有 `nft`、`python3`、`flock` 和 `systemctl`。
+
+独立使用 `inet jsh_ipban` 防火墙表，针对指定**来源 IPv4 + 目标端口**在 PREROUTING 阶段丢弃 TCP / UDP 数据包（在 DNAT 前匹配）。**它是服务器级别的规则，不是按 GitHub 仓库或 VLESS 用户隔离的规则**，同一服务器上其他服务只要匹配此 IP/端口也会被拦截。IPv6 不受此规则影响。操作前请确认目标端口不是远程 SSH 管理端口。
+
+### 1. 永久拉黑（单 IP / 批量，一行命令）
+
+```bash
+P=40001 IPS="1.2.3.4 5.6.7.8 9.10.11.12" bash -c 'set -euo pipefail; (( EUID == 0 )) || { echo "需 root 权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P <= 65535 )) || { echo "端口无效"; exit 1; }; read -r -a A <<< "$IPS"; (( ${#A[@]} > 0 )) || { echo "IP 列表为空"; exit 1; }; python3 -c "import ipaddress,sys; [ipaddress.IPv4Address(x) for x in sys.argv[1:]]" "${A[@]}"; exec 9>/run/jsh-ipban.lock; flock -x 9; if ! nft list table inet jsh_ipban >/dev/null 2>&1; then printf "%s\n" "add table inet jsh_ipban" "add chain inet jsh_ipban pre { type filter hook prerouting priority -150; policy accept; }" "add set inet jsh_ipban banned { type ipv4_addr . inet_service; }" "add rule inet jsh_ipban pre meta l4proto { tcp, udp } ip saddr . th dport @banned drop" | nft -f -; fi; for IP in "${A[@]}"; do nft get element inet jsh_ipban banned "{ $IP . $P }" >/dev/null 2>&1 || nft add element inet jsh_ipban banned "{ $IP . $P }"; done; umask 077; nft list table inet jsh_ipban >/etc/jsh-ipban.nft.tmp; mv -f /etc/jsh-ipban.nft.tmp /etc/jsh-ipban.nft; printf "%s\n" "[Unit]" "Description=Jieshu IP port blacklist" "After=nftables.service" "Before=network.target" "[Service]" "Type=oneshot" "ExecStart=/usr/sbin/nft -f /etc/jsh-ipban.nft" "[Install]" "WantedBy=multi-user.target" >/etc/systemd/system/jsh-ipban.service; systemctl daemon-reload; systemctl enable jsh-ipban.service >/dev/null; echo "已封锁端口 $P：${A[*]}"'
+```
+
+重复运行可以追加新 IP，不会主动清除已有黑名单；重复添加已有 IP 不产生第二条记录。可对其他端口再次执行。通过 `/etc/jsh-ipban.nft` 保存当前规则，并启用 `jsh-ipban.service`，在正常系统重启后尝试恢复。
+
+### 2. 解封（单 IP / 批量，一行命令，最后一条解封时清理）
+
+```bash
+P=40001 IPS="1.2.3.4 5.6.7.8" bash -c 'set -euo pipefail; (( EUID == 0 )) || { echo "需 root 权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P <= 65535 )) || { echo "端口无效"; exit 1; }; read -r -a A <<< "$IPS"; (( ${#A[@]} > 0 )) || { echo "IP 列表为空"; exit 1; }; python3 -c "import ipaddress,sys; [ipaddress.IPv4Address(x) for x in sys.argv[1:]]" "${A[@]}"; exec 9>/run/jsh-ipban.lock; flock -x 9; if nft list table inet jsh_ipban >/dev/null 2>&1; then for IP in "${A[@]}"; do if nft get element inet jsh_ipban banned "{ $IP . $P }" >/dev/null 2>&1; then nft delete element inet jsh_ipban banned "{ $IP . $P }"; fi; done; EMPTY=$(nft -j list set inet jsh_ipban banned | python3 -c "import json,sys; a=[x[\"set\"] for x in json.load(sys.stdin)[\"nftables\"] if \"set\" in x]; assert len(a)==1; print(\"yes\" if not a[0].get(\"elem\") else \"no\")"); else EMPTY=yes; fi; if [[ $EMPTY == yes ]]; then systemctl disable jsh-ipban.service >/dev/null 2>&1 || true; if nft list table inet jsh_ipban >/dev/null 2>&1; then nft delete table inet jsh_ipban; fi; rm -f /etc/jsh-ipban.nft /etc/jsh-ipban.nft.tmp /etc/systemd/system/jsh-ipban.service /etc/systemd/system/multi-user.target.wants/jsh-ipban.service; systemctl daemon-reload; rm -f /run/jsh-ipban.lock; echo "已解封；黑名单为空，已清理本模块专属规则与文件"; else nft list table inet jsh_ipban >/etc/jsh-ipban.nft.tmp; mv -f /etc/jsh-ipban.nft.tmp /etc/jsh-ipban.nft; echo "已解封指定 IP；其余黑名单保留"; fi'
+```
+
+**解封清理：** 只解除指定的来源 IP + 端口组合；其他封禁保留。全部解封后，会删除本功能的 nftables 表/链/集合/规则、开机恢复服务、启用链接、持久化配置及锁文件。不会删除系统日志、Bash 历史，也不会主动清除已有 TCP / conntrack 连接状态。**不要并发执行封禁和解封命令**，以避免最后一次清理锁文件时发生竞争。
+
+**与仓库及现有功能的关系：** 这两条命令不会自动修改任何 GitHub 仓库，也不会直接改动 VLESS、SOCKS5、WG-NAT 的 UUID、配额或 IP_LIMIT 数据。但防火墙规则作用于整台执行命令的服务器，可能影响同一端口上的其他应用或 NAT 转发流量。本 README 第十节的「临时封禁整个端口」与此处的 IP 黑名单是两套独立规则；即使解封了 IP，如果那个端口还有临时封禁或其他防火墙策略，仍可能无法连接。
+
+**验证说明：** 命令已检查 Bash 语法，未在生产服务器上实际执行；系统重启、防火墙管理程序重载、其他服务清空 nftables 规则时，应以实时 `nft list table inet jsh_ipban` 和 `systemctl status jsh-ipban.service` 的结果为准。
