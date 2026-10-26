@@ -901,9 +901,9 @@ wg show wg-exit latest-handshakes
 请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。
 ## 十、临时封禁 / 解封单个 VLESS 端口（删除后无残留）
 
-在**运行该 VLESS 节点的服务器**（例如 `MEGABOX`）以 root 身份执行。以下**三条命令互相独立**，每次只需修改各自第一行的 `PORT=40022`，换成要操作的端口即可。无需安装脚本、无需创建文件。仅针对**外部 IPv4 TCP** 入站流量；不处理 IPv6 或 UDP。
+在**运行该 VLESS 节点的服务器**（例如 `MEGABOX`）以 root 身份执行。**下面三条命令互相独立，每次只改各自的 `PORT=40022` 数字即可。** 不需要安装脚本，也不创建配置文件。
 
-使用独立的 nftables 临时表 `pause_vless_端口`，不会停止/重启 Xray、WG 或 systemd 服务，不修改 UUID、配额、IP_LIMIT、其他端口及已有防火墙表。**解除封禁会整张删除这次创建的表（包括链和规则），不留下 nftables 规则或额外配置文件**；不创建持久化任务。封禁不设自动到期时间，通常在服务器重启或防火墙规则被重载后失效。
+本功能同时封禁**外部 IPv4 / IPv6 的 TCP / UDP 入站**（四种组合）；`lo` 回环流量不拦截。采用每个端口独立的 `inet pause_vless_端口` 临时表，不停止或重启 Xray、WG、systemd，不修改 UUID、配额、IP_LIMIT、已有流量统计或其他端口的规则。**仅处理发往本机的 INPUT 流量**，不处理 FORWARD 转发端口或从本机主动发起的出站连接。
 
 ### 1. 临时封禁（只改 PORT）
 
@@ -912,28 +912,26 @@ wg show wg-exit latest-handshakes
 PORT=40022
 [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
 T="pause_vless_$PORT"
-if nft list table inet "$T" >/dev/null 2>&1; then
-  if nft list chain inet "$T" input 2>/dev/null | grep -Fq "tcp dport $PORT reject with tcp reset"; then
-    echo "✅ $PORT 已临时封禁，无需重复添加"
-  else
-    echo "❌ $PORT 临时表已存在但规则异常，未修改任何内容"
-  fi
-else
-  if nft -f - >/dev/null 2>&1 <<EOF
+if ! nft list table inet "$T" >/dev/null 2>&1; then
+  nft -f - >/dev/null 2>&1 <<EOF
 add table inet $T
 add chain inet $T input { type filter hook input priority -20; policy accept; }
-add rule inet $T input iifname != "lo" meta nfproto ipv4 tcp dport $PORT reject with tcp reset
+add rule inet $T input iifname != "lo" tcp dport $PORT reject with tcp reset
+add rule inet $T input iifname != "lo" udp dport $PORT drop
 EOF
-  then
-    echo "✅ $PORT 临时封禁成功"
-  else
-    echo "❌ $PORT 临时封禁失败"
-  fi
+fi
+R=$(nft list chain inet "$T" input 2>/dev/null) || R=""
+if grep -Fq "iifname != \"lo\" tcp dport $PORT reject with tcp reset" <<<"$R" &&
+   grep -Fq "iifname != \"lo\" udp dport $PORT drop" <<<"$R"; then
+  echo "✅ $PORT 已临时封禁（IPv4 + IPv6 + TCP + UDP）"
+else
+  echo "❌ $PORT 封禁失败或存在旧版规则；如存在旧版临时表，请先执行第 2 条解封，再重试"
+  exit 1
 fi
 )
 ```
 
-### 2. 解除封禁（只改 PORT，无防火墙残留）
+### 2. 解除封禁（只改 PORT，删除本功能的整张表）
 
 ```bash
 (
@@ -941,31 +939,34 @@ PORT=40022
 [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
 T="pause_vless_$PORT"
 if nft list table inet "$T" >/dev/null 2>&1; then
-  if nft delete table inet "$T" >/dev/null 2>&1 && ! nft list table inet "$T" >/dev/null 2>&1; then
-    echo "✅ $PORT 解封成功，临时表和规则已全部删除"
-  else
-    echo "❌ $PORT 解封失败，请检查"
-  fi
+  nft delete table inet "$T" >/dev/null 2>&1
+fi
+if nft list table inet "$T" >/dev/null 2>&1; then
+  echo "❌ $PORT 解封失败，临时封禁表仍存在"
+  exit 1
 else
-  echo "✅ $PORT 本来就没有临时封禁表，无需解除"
+  echo "✅ $PORT 已解封，临时表、链、规则均已删除"
 fi
 )
 ```
 
-### 3. 查询是否封禁（只改 PORT，只显示中文结果）
+### 3. 查询封禁状态（只改 PORT，只输出中文结果）
 
 ```bash
 (
 PORT=40022
 [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
 T="pause_vless_$PORT"
-if nft list chain inet "$T" input 2>/dev/null | grep -Fq "tcp dport $PORT reject with tcp reset"; then
-  echo "✅ $PORT 临时封禁成功（规则存在）"
+R=$(nft list chain inet "$T" input 2>/dev/null) || R=""
+if grep -Fq "iifname != \"lo\" tcp dport $PORT reject with tcp reset" <<<"$R" &&
+   grep -Fq "iifname != \"lo\" udp dport $PORT drop" <<<"$R"; then
+  echo "✅ $PORT 已封禁（IPv4 + IPv6 + TCP + UDP）"
 else
-  echo "❌ $PORT 未处于此临时封禁状态"
+  echo "❌ $PORT 未完整封禁（或没有临时封禁规则）"
 fi
 )
 ```
 
-**说明：** 查询的是**本功能的临时封禁规则**，不是测试外网实际连通性；若存在其他防火墙规则，解除后也不能保证端口一定可访问。封禁期间 Xray 仍可显示 `active` 和 `LISTEN`，属正常现象。解除后无本功能的 nftables 对象残留，但交互式终端可能在 shell history 中保存你输入过的命令文字。
+**无残留说明：** 解除封禁会删除这个端口专属的 nftables 表以及其中全部链和规则，不产生本功能的配置文件、定时任务或后台进程。命令本身仍可能留在 Bash history；已有 TCP 连接在内核中的状态、系统日志不会因此自动清除。
 
+**注意：** 本功能只检查其专属临时规则，不能替代外部网络连通性测试。解除后若还有其他防火墙规则，端口仍可能无法访问；封禁时服务显示 `active`、端口显示 `LISTEN` 是正常的。临时规则不设到期时间，通常在重启或防火墙规则重载后失效。若端口存在之前创建的旧版 IPv4-only 临时表，第 1 条不会擅自覆盖；先用第 2 条删除旧表，再执行第 1 条重新封禁即可。
