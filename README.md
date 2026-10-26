@@ -899,3 +899,73 @@ wg show wg-exit latest-handshakes
 ---
 
 请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。
+## 十、临时封禁 / 解封单个 VLESS 端口（删除后无残留）
+
+在**运行该 VLESS 节点的服务器**（例如 \`MEGABOX\`）以 root 身份执行。以下**三条命令互相独立**，每次只需修改各自第一行的 \`PORT=40022\`，换成要操作的端口即可。无需安装脚本、无需创建文件。仅针对**外部 IPv4 TCP** 入站流量；不处理 IPv6 或 UDP。
+
+使用独立的 nftables 临时表 \`pause_vless_端口\`，不会停止/重启 Xray、WG 或 systemd 服务，不修改 UUID、配额、IP_LIMIT、其他端口及已有防火墙表。**解除封禁会整张删除这次创建的表（包括链和规则），不留下 nftables 规则或额外配置文件**；不创建持久化任务。封禁不设自动到期时间，通常在服务器重启或防火墙规则被重载后失效。
+
+### 1. 临时封禁（只改 PORT）
+
+\`\`\`bash
+(
+PORT=40022
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
+T="pause_vless_$PORT"
+if nft list table inet "$T" >/dev/null 2>&1; then
+  if nft list chain inet "$T" input 2>/dev/null | grep -Fq "tcp dport $PORT reject with tcp reset"; then
+    echo "✅ $PORT 已临时封禁，无需重复添加"
+  else
+    echo "❌ $PORT 临时表已存在但规则异常，未修改任何内容"
+  fi
+else
+  if nft -f - >/dev/null 2>&1 <<EOF
+add table inet $T
+add chain inet $T input { type filter hook input priority -20; policy accept; }
+add rule inet $T input iifname != "lo" meta nfproto ipv4 tcp dport $PORT reject with tcp reset
+EOF
+  then
+    echo "✅ $PORT 临时封禁成功"
+  else
+    echo "❌ $PORT 临时封禁失败"
+  fi
+fi
+)
+\`\`\`
+
+### 2. 解除封禁（只改 PORT，无防火墙残留）
+
+\`\`\`bash
+(
+PORT=40022
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
+T="pause_vless_$PORT"
+if nft list table inet "$T" >/dev/null 2>&1; then
+  if nft delete table inet "$T" >/dev/null 2>&1 && ! nft list table inet "$T" >/dev/null 2>&1; then
+    echo "✅ $PORT 解封成功，临时表和规则已全部删除"
+  else
+    echo "❌ $PORT 解封失败，请检查"
+  fi
+else
+  echo "✅ $PORT 本来就没有临时封禁表，无需解除"
+fi
+)
+\`\`\`
+
+### 3. 查询是否封禁（只改 PORT，只显示中文结果）
+
+\`\`\`bash
+(
+PORT=40022
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
+T="pause_vless_$PORT"
+if nft list chain inet "$T" input 2>/dev/null | grep -Fq "tcp dport $PORT reject with tcp reset"; then
+  echo "✅ $PORT 临时封禁成功（规则存在）"
+else
+  echo "❌ $PORT 未处于此临时封禁状态"
+fi
+)
+\`\`\`
+
+**说明：** 查询的是**本功能的临时封禁规则**，不是测试外网实际连通性；若存在其他防火墙规则，解除后也不能保证端口一定可访问。封禁期间 Xray 仍可显示 \`active\` 和 \`LISTEN\`，属正常现象。解除后无本功能的 nftables 对象残留，但交互式终端可能在 shell history 中保存你输入过的命令文字。
+
