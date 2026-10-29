@@ -971,28 +971,54 @@ fi
 
 **注意：** 本功能只检查其专属临时规则，不能替代外部网络连通性测试。解除后若还有其他防火墙规则，端口仍可能无法访问；封禁时服务显示 `active`、端口显示 `LISTEN` 是正常的。临时规则不设到期时间，通常在重启或防火墙规则重载后失效。若端口存在之前创建的旧版 IPv4-only 临时表，第 1 条不会擅自覆盖；先用第 2 条删除旧表，再执行第 1 条重新封禁即可。
 
-## 十一、指定端口按来源 IP 永久拉黑 / 解封（支持批量）
+## 十一、指定端口永久拉黑 / 解封（单 IP、CIDR 网段混合批量）
 
-在**需要封禁的 Debian 12 服务器**上以 root 身份执行。**不需要首次初始化或安装**。每次只改命令最前面的 `P=40001`（端口）和 `IPS="..."`（来源 IPv4，多 IP 用空格分隔）。只封一个 IP 时也使用同一命令，例如 `IPS="1.2.3.4"`。依赖系统现有 `nft`、`python3`、`flock` 和 `systemctl`。
+在需要封禁的 Debian 12 服务器上以 root 身份执行。无需下载、安装或修改管理脚本；每条命令都是**单行命令**。只需修改最前面的 **P=40001**（本机目标端口）和 **IPS="..."**（空格隔开的 IPv4 或 CIDR 网段）。例如 **1.2.3.4**、**27.47.34.0/24**，也可以同时输入。带掩码的地址必须写规范网络地址，如 **27.47.34.0/24**，不要写 **27.47.34.26/24**。IPv4 单地址会规范化为 /32。
 
-独立使用 `inet jsh_ipban` 防火墙表，针对指定**来源 IPv4 + 目标端口**在 PREROUTING 阶段丢弃 TCP / UDP 数据包（在 DNAT 前匹配）。**它是服务器级别的规则，不是按 GitHub 仓库或 VLESS 用户隔离的规则**，同一服务器上其他服务只要匹配此 IP/端口也会被拦截。IPv6 不受此规则影响。操作前请确认目标端口不是远程 SSH 管理端口。
+新封禁统一使用独立 **inet jsh_cidrban** 表；原 README 使用的 **inet jsh_ipban** 表和现有单 IP 黑名单不受新增封禁影响。两种表的规则都按来源 IPv4 + 目标端口，在 PREROUTING 阶段丢弃 TCP / UDP 流量（DNAT 前）；不针对 IPv6。**这是服务器级别的封禁，不是按 VLESS 用户隔离的功能。** 切勿误填 SSH 管理端口，操作前建议保留已有 SSH 会话。
 
-### 1. 永久拉黑（单 IP / 批量，一行命令）
+### 1. 永久拉黑（单 IP / 网段混合，一行）
 
-```bash
-P=40001 IPS="1.2.3.4 5.6.7.8 9.10.11.12" bash -c 'set -euo pipefail; (( EUID == 0 )) || { echo "需 root 权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P <= 65535 )) || { echo "端口无效"; exit 1; }; read -r -a A <<< "$IPS"; (( ${#A[@]} > 0 )) || { echo "IP 列表为空"; exit 1; }; python3 -c "import ipaddress,sys; [ipaddress.IPv4Address(x) for x in sys.argv[1:]]" "${A[@]}"; exec 9>/run/jsh-ipban.lock; flock -x 9; if ! nft list table inet jsh_ipban >/dev/null 2>&1; then printf "%s\n" "add table inet jsh_ipban" "add chain inet jsh_ipban pre { type filter hook prerouting priority -150; policy accept; }" "add set inet jsh_ipban banned { type ipv4_addr . inet_service; }" "add rule inet jsh_ipban pre meta l4proto { tcp, udp } ip saddr . th dport @banned drop" | nft -f -; fi; for IP in "${A[@]}"; do nft get element inet jsh_ipban banned "{ $IP . $P }" >/dev/null 2>&1 || nft add element inet jsh_ipban banned "{ $IP . $P }"; done; umask 077; nft list table inet jsh_ipban >/etc/jsh-ipban.nft.tmp; mv -f /etc/jsh-ipban.nft.tmp /etc/jsh-ipban.nft; printf "%s\n" "[Unit]" "Description=Jieshu IP port blacklist" "After=nftables.service" "Before=network.target" "[Service]" "Type=oneshot" "ExecStart=/usr/sbin/nft -f /etc/jsh-ipban.nft" "[Install]" "WantedBy=multi-user.target" >/etc/systemd/system/jsh-ipban.service; systemctl daemon-reload; systemctl enable jsh-ipban.service >/dev/null; echo "已封锁端口 $P：${A[*]}"'
-```
+~~~bash
+P=40001 IPS="1.2.3.4 5.6.7.8 27.47.34.0/24" bash -c 'set -euo pipefail; (( EUID==0 )) || { echo "需root权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P<=65535 )) || { echo "端口无效"; exit 1; }; read -r -a A <<< "$IPS"; (( ${#A[@]} > 0 )) || { echo "IP列表为空"; exit 1; }; NETS=$(python3 -B -c "import ipaddress,sys; [print(ipaddress.IPv4Network(s,strict=True)) for s in sys.argv[1:]]" "${A[@]}"); exec 9>/run/jsh-cidrban.lock; flock -x 9; if ! nft list table inet jsh_cidrban >/dev/null 2>&1; then printf "%s\n" "add table inet jsh_cidrban" "add chain inet jsh_cidrban pre { type filter hook prerouting priority -150; policy accept; }" | nft -f -; fi; for NET in $NETS; do MARK="jshcidr:$P:$NET"; if ! nft -a list chain inet jsh_cidrban pre | grep -Fq "comment \"$MARK\""; then printf "add rule inet jsh_cidrban pre ip saddr %s meta l4proto { tcp, udp } th dport %s counter drop comment \"%s\"\n" "$NET" "$P" "$MARK" | nft -f -; fi; done; umask 077; nft list table inet jsh_cidrban >/etc/jsh-cidrban.nft.tmp; mv -f /etc/jsh-cidrban.nft.tmp /etc/jsh-cidrban.nft; printf "%s\n" "[Unit]" "Description=Jieshu CIDR port blacklist" "After=nftables.service" "Before=network.target" "[Service]" "Type=oneshot" "ExecStart=/usr/sbin/nft -f /etc/jsh-cidrban.nft" "[Install]" "WantedBy=multi-user.target" >/etc/systemd/system/jsh-cidrban.service; systemctl daemon-reload; systemctl enable jsh-cidrban.service >/dev/null; echo "已封禁端口 $P：${A[*]}"'
+~~~
 
-重复运行可以追加新 IP，不会主动清除已有黑名单；重复添加已有 IP 不产生第二条记录。可对其他端口再次执行。通过 `/etc/jsh-ipban.nft` 保存当前规则，并启用 `jsh-ipban.service`，在正常系统重启后尝试恢复。
+重复运行相同 IP/网段和端口会跳过已有的受管理规则；不同端口可以分别添加。规则保存至 **/etc/jsh-cidrban.nft**，启用 **jsh-cidrban.service** 尝试在重启后恢复。现有 **jsh_ipban** 不会被覆盖。此命令会修改 nftables、防火墙配置与 systemd 状态。
 
-### 2. 解封（单 IP / 批量，一行命令，最后一条解封时清理）
+### 2. 一键查询全部黑名单（只读，按端口排序）
 
-```bash
-P=40001 IPS="1.2.3.4 5.6.7.8" bash -c 'set -euo pipefail; (( EUID == 0 )) || { echo "需 root 权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P <= 65535 )) || { echo "端口无效"; exit 1; }; read -r -a A <<< "$IPS"; (( ${#A[@]} > 0 )) || { echo "IP 列表为空"; exit 1; }; python3 -c "import ipaddress,sys; [ipaddress.IPv4Address(x) for x in sys.argv[1:]]" "${A[@]}"; exec 9>/run/jsh-ipban.lock; flock -x 9; if nft list table inet jsh_ipban >/dev/null 2>&1; then for IP in "${A[@]}"; do if nft get element inet jsh_ipban banned "{ $IP . $P }" >/dev/null 2>&1; then nft delete element inet jsh_ipban banned "{ $IP . $P }"; fi; done; EMPTY=$(nft -j list set inet jsh_ipban banned | python3 -c "import json,sys; a=[x[\"set\"] for x in json.load(sys.stdin)[\"nftables\"] if \"set\" in x]; assert len(a)==1; print(\"yes\" if not a[0].get(\"elem\") else \"no\")"); else EMPTY=yes; fi; if [[ $EMPTY == yes ]]; then systemctl disable jsh-ipban.service >/dev/null 2>&1 || true; if nft list table inet jsh_ipban >/dev/null 2>&1; then nft delete table inet jsh_ipban; fi; rm -f /etc/jsh-ipban.nft /etc/jsh-ipban.nft.tmp /etc/systemd/system/jsh-ipban.service /etc/systemd/system/multi-user.target.wants/jsh-ipban.service; systemctl daemon-reload; rm -f /run/jsh-ipban.lock; echo "已解封；黑名单为空，已清理本模块专属规则与文件"; else nft list table inet jsh_ipban >/etc/jsh-ipban.nft.tmp; mv -f /etc/jsh-ipban.nft.tmp /etc/jsh-ipban.nft; echo "已解封指定 IP；其余黑名单保留"; fi'
-```
+~~~bash
+{ nft -n list chain inet jsh_cidrban pre 2>/dev/null | sed -n 's/.*comment "jshcidr:\([0-9][0-9]*\):\([^"]*\)".*/\1 \2/p'; nft -n list set inet jsh_ipban banned 2>/dev/null | awk '/elements =/ {inside=1} inside {gsub(/[{},]/," "); for(i=1;i<=NF-2;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $(i+1)=="." && $(i+2) ~ /^[0-9]+$/) print $(i+2),$i}'; } | sort -k1,1n -k2,2V -u | awk 'BEGIN{print "========== IP黑名单总览 =========="} {if($1!=p){if(NR>1)printf "  小计：%d项\n\n",c; p=$1; c=0; ports++; printf "【端口 %s】\n",p} addr=$2; if(addr ~ /\/32$/)sub(/\/32$/,"",addr); printf "  %-22s %s\n",addr,(index(addr,"/")?"整个网段":"单独IP"); c++; total++} END{if(total){printf "  小计：%d项\n",c}else print "没有查到这两套黑名单的封禁条目"; printf "\n总计：%d个端口，%d项封禁\n",ports,total}'
+~~~
 
-**解封清理：** 只解除指定的来源 IP + 端口组合；其他封禁保留。全部解封后，会删除本功能的 nftables 表/链/集合/规则、开机恢复服务、启用链接、持久化配置及锁文件。不会删除系统日志、Bash 历史，也不会主动清除已有 TCP / conntrack 连接状态。**不要并发执行封禁和解封命令**，以避免最后一次清理锁文件时发生竞争。
+依次显示每个端口的封禁地址、单独 IP / 整个网段和封禁条目小计，并显示总端口数、总条目数。**只读取 nftables 当前规则，不创建文件、不修改防火墙、不清零计数器。** 同时兼容原有的 jsh_ipban 与新的 jsh_cidrban；显示的是封禁条目数，而不是已经拦截的数据包数。若存在手工写在其他防火墙表中的黑名单，本查询不会收录。
 
-**与仓库及现有功能的关系：** 这两条命令不会自动修改任何 GitHub 仓库，也不会直接改动 VLESS、SOCKS5、WG-NAT 的 UUID、配额或 IP_LIMIT 数据。但防火墙规则作用于整台执行命令的服务器，可能影响同一端口上的其他应用或 NAT 转发流量。本 README 第十节的「临时封禁整个端口」与此处的 IP 黑名单是两套独立规则；即使解封了 IP，如果那个端口还有临时封禁或其他防火墙策略，仍可能无法连接。
+### 3. 解除指定 IP 或网段（混合批量，一行）
 
-**验证说明：** 命令已检查 Bash 语法，未在生产服务器上实际执行；系统重启、防火墙管理程序重载、其他服务清空 nftables 规则时，应以实时 `nft list table inet jsh_ipban` 和 `systemctl status jsh-ipban.service` 的结果为准。
+~~~bash
+P=40001 IPS="1.2.3.4 27.47.34.0/24" bash -c 'set -euo pipefail; (( EUID==0 )) || { echo "需root权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P<=65535 )) || { echo "端口无效"; exit 1; }; read -r -a A <<< "$IPS"; (( ${#A[@]} > 0 )) || { echo "IP列表为空"; exit 1; }; NETS=$(python3 -B -c "import ipaddress,sys; [print(ipaddress.IPv4Network(s,strict=True)) for s in sys.argv[1:]]" "${A[@]}"); exec 8>/run/jsh-ipban.lock; flock -x 8; exec 9>/run/jsh-cidrban.lock; flock -x 9; N=0; for NET in $NETS; do if [[ $NET == */32 ]] && nft list set inet jsh_ipban banned >/dev/null 2>&1; then IP=${NET%/32}; if nft get element inet jsh_ipban banned "{ $IP . $P }" >/dev/null 2>&1; then nft delete element inet jsh_ipban banned "{ $IP . $P }"; N=$((N+1)); fi; fi; if nft list chain inet jsh_cidrban pre >/dev/null 2>&1; then MARK="jshcidr:$P:$NET"; for H in $(nft -a list chain inet jsh_cidrban pre | grep -F "comment \"$MARK\"" | sed -n "s/.*# handle \([0-9][0-9]*\).*/\1/p" || true); do nft delete rule inet jsh_cidrban pre handle "$H"; N=$((N+1)); done; fi; done; if nft list table inet jsh_ipban >/dev/null 2>&1; then umask 077; nft list table inet jsh_ipban >/etc/jsh-ipban.nft.tmp; mv -f /etc/jsh-ipban.nft.tmp /etc/jsh-ipban.nft; fi; if nft list table inet jsh_cidrban >/dev/null 2>&1; then REM=$(nft -j list chain inet jsh_cidrban pre | python3 -B -c "import json,sys; print(sum(\"rule\" in x for x in json.load(sys.stdin)[\"nftables\"]))"); if [[ $REM == 0 ]]; then systemctl disable jsh-cidrban.service >/dev/null 2>&1 || true; nft delete table inet jsh_cidrban; rm -f /etc/jsh-cidrban.nft /etc/jsh-cidrban.nft.tmp /etc/systemd/system/jsh-cidrban.service; systemctl daemon-reload; else umask 077; nft list table inet jsh_cidrban >/etc/jsh-cidrban.nft.tmp; mv -f /etc/jsh-cidrban.nft.tmp /etc/jsh-cidrban.nft; fi; fi; echo "端口 $P 已解除 $N 条指定封禁；其他端口保持不变"'
+~~~
+
+可同时解封原版 jsh_ipban 中的独立 IPv4 和新版 jsh_cidrban 的独立 IPv4（/32）或 CIDR 网段。只解封 P 对应的规则，不删除其他端口封禁；新表规则清空时会清理新模块的持久化文件和服务。**出于避免误删不受此功能管理的规则考虑，旧版 jsh_ipban 即使元素清空也会保留表及其恢复服务（空表不会实际封禁）。**
+
+### 4. 清空某一个端口的受管理 IP 黑名单（一行）
+
+~~~bash
+P=40001 bash -c 'set -euo pipefail; (( EUID==0 )) || { echo "需root权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P<=65535 )) || { echo "端口无效"; exit 1; }; exec 8>/run/jsh-ipban.lock; flock -x 8; exec 9>/run/jsh-cidrban.lock; flock -x 9; OLD=0; NEW=0; if nft list set inet jsh_ipban banned >/dev/null 2>&1; then IPS=$(nft -j list set inet jsh_ipban banned | python3 -B -c "import json,sys,ipaddress; a=[x[\"set\"] for x in json.load(sys.stdin)[\"nftables\"] if \"set\" in x and x[\"set\"].get(\"name\")==\"banned\"]; assert len(a)==1; e=a[0].get(\"elem\",[]); v=[x[\"elem\"][\"val\"] if isinstance(x,dict) and \"elem\" in x else x for x in e]; pairs=[x[\"concat\"] for x in v if isinstance(x,dict) and isinstance(x.get(\"concat\"),list) and len(x[\"concat\"])==2]; assert len(pairs)==len(v),\"元素格式异常\"; [print(ipaddress.IPv4Address(x[0])) for x in pairs if int(x[1])==int(sys.argv[1])]" "$P"); for IP in $IPS; do nft delete element inet jsh_ipban banned "{ $IP . $P }"; OLD=$((OLD+1)); done; umask 077; nft list table inet jsh_ipban >/etc/jsh-ipban.nft.tmp; mv -f /etc/jsh-ipban.nft.tmp /etc/jsh-ipban.nft; fi; if nft list chain inet jsh_cidrban pre >/dev/null 2>&1; then HANDLES=$(nft -j -a list chain inet jsh_cidrban pre | python3 -B -c "import json,sys; a=[x[\"rule\"] for x in json.load(sys.stdin)[\"nftables\"] if \"rule\" in x]; [print(x[\"handle\"]) for x in a if str(x.get(\"comment\",\"\")).startswith(\"jshcidr:\"+sys.argv[1]+\":\")]" "$P"); for H in $HANDLES; do [[ $H =~ ^[0-9]+$ ]] || exit 1; nft delete rule inet jsh_cidrban pre handle "$H"; NEW=$((NEW+1)); done; REM=$(nft -j list chain inet jsh_cidrban pre | python3 -B -c "import json,sys; print(sum(\"rule\" in x for x in json.load(sys.stdin)[\"nftables\"]))"); if [[ $REM == 0 ]]; then systemctl disable jsh-cidrban.service >/dev/null 2>&1 || true; nft delete table inet jsh_cidrban; rm -f /etc/jsh-cidrban.nft /etc/jsh-cidrban.nft.tmp /etc/systemd/system/jsh-cidrban.service; systemctl daemon-reload; else umask 077; nft list table inet jsh_cidrban >/etc/jsh-cidrban.nft.tmp; mv -f /etc/jsh-cidrban.nft.tmp /etc/jsh-cidrban.nft; fi; fi; echo "端口 $P 已清除：原版单IP $OLD 条，混合规则 $NEW 条；其他端口保留"'
+~~~
+
+只清理所填 P 在旧版 jsh_ipban 集合中的独立 IP，以及新版 jsh_cidrban 表中标记为 jshcidr:该端口: 的规则；**不会清空其他端口，也不会碰本 README 第十节的独立整端口暂停规则或 IP_LIMIT 等限制。** 原版表为空时仍会保留空表（避免误删其他未被识别的旧版配置）；新表完全没有剩余规则时会删除自己的表、恢复服务与配置。
+
+### 5. 验证与注意事项
+
+~~~bash
+nft -a list chain inet jsh_cidrban pre
+nft -a list set inet jsh_ipban banned 2>/dev/null
+systemctl is-enabled jsh-cidrban.service
+~~~
+
+- **封禁生效**：规则中的 counter packets / bytes 代表命中的数据包数 / 字节数，不是 TCP 连接数；新增规则不会强制清除已经建立的连接跟踪状态。
+- **重启恢复**：已安装的 jsh-cidrban.service 负责读取保存的规则；当前运行时已核对不等于已经在重启场景验证，重启或防火墙重载后须再查询。
+- **并发安全**：原版和新版有各自的锁；本节解封命令依固定顺序取得两把锁。不要在多台终端同时执行封禁、解封或清空命令；不要手工编辑管理表的规则注释。
+- **适用范围**：只对本机收到的对应端口数据包匹配，可能影响 NAT/转发，勿把大范围网段误当成某个城市的全部地址。规则不覆盖 IPv6。
+- **验证说明**：以上属于 README 操作命令，已核对 Bash 结构及所使用的 nftables 规则格式；GitHub 文档更新不会改变当前服务器。仍需在目标 Debian 12 环境实际验证。
