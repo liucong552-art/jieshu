@@ -20,6 +20,7 @@
 | 共享嫌疑、访问目标、异常端口 | `PORT=40000 DAYS=7 vless-abuse`（[首次安装](#abuse-install)） |
 | 全部受管理黑名单 | [查黑名单](#blacklist-report) |
 | SOCKS5 账号、到期、剩余配额及 IP 占用 | `socks5 list` |
+| SOCKS5 今天 / 某端口每日流量 | `socks5-traffic` / `socks5-traffic 41004`（[说明](#socks5-daily)） |
 | SOCKS5 连接链接 | `socks5 link 41004` |
 | SOCKS5 访问域名与连接错误 | [SOCKS5 审计](#socks5-access) |
 | NAT 出口机运行状态 | 在 NAT 出口机执行 `bash /root/nat.sh status` |
@@ -156,6 +157,8 @@ PORT=40000 DAYS=7 vless-abuse
 改 `PORT` 选择端口；`DAYS=1～90` 查最近天数，`DAYS=0` 查创建以来仍保留的日志。输出来源 IP、目标、异常端口、共享线索及当前 TCP 连接；只读，不自动封禁。历史取决于已记录且保留的日志，风险标记不是滥用定论。
 
 
+
+<a id="socks5-daily"></a>
 
 <details>
 <summary>SOCKS5 每日流量查询</summary>
