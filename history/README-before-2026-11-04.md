@@ -1,0 +1,1024 @@
+# VLESS Reality / WG-NAT / SOCKS5 安装与使用手册
+
+本仓库固定保留 **11 个文件**。这份说明按照新手实际操作顺序编排，复制命令前先确认自己处于哪台服务器。
+
+| 文件 | 运行位置 | 用途 |
+|---|---|---|
+| `vless.sh` | VLESS VPS | 安装主节点和普通临时节点 |
+| `vpswg.sh` | VLESS VPS | 配置 WG-NAT 的 VPS 端 |
+| `nat.sh` | NAT 出口机 | 配置和管理多个 VPS 共用的 NAT 出口 |
+| `natjichang.sh` | VLESS VPS | 安装 WG-NAT 临时节点工具 |
+| `traffic.py` | VLESS VPS | 可选：每日流量统计 |
+| `portbw-install.sh`、`portbw.py` | 要限速的服务器 | 可选：按端口限速 |
+| `socks5-install.sh`、`socks5.py`、`socks5-traffic.py` | 独立 SOCKS5 主机 | 可选：SOCKS5 账号管理和流量统计 |
+
+**按需求查看：** 只用 VLESS：第一～四节；使用另一个 NAT 出口：第五节；更新与排查：第六～七节；独立 SOCKS5：第八节；生产安全提醒：第九节。
+
+> `nat.sh` 仅在 NAT 出口机运行。`vpswg.sh` 和 `natjichang.sh` 仅在 VLESS VPS 运行。不要在客户共用的 NAT 机器上直接试运行 `init/add/del`：它们会重启 WG 接口。
+## 当前正式版：V4（2026-10-16）
+
+- **正式版发布提交**：[`5509924ddde3219d1f1660e582c281bc913034ea`](https://github.com/liucong552-art/jieshu/commit/5509924ddde3219d1f1660e582c281bc913034ea)，对应 [PR #2](https://github.com/liucong552-art/jieshu/pull/2)。
+- **V4 Watchdog CPU 优化**：批量复用 nftables 状态查询，减少 25 个临时节点巡检时的重复开销；不会改变已有节点的端口、UUID、配额及到期时间。实际 CPU 节省取决于真实连接数和流量，不能由节点数量推算。
+- **WG-NAT 握手时间修复**：Watchdog 判断握手有效期时使用检查当下的时间，避免将本轮巡检开始之后出现的新握手误判为“未来握手”。
+- **发布范围**：本次 V4 主要更新 `vless.sh`（及测试和 CI）。`nat.sh`、`vpswg.sh`、`natjichang.sh` 等仍为各自已发布的文件，运行 `vless.sh` **不会**自动重新部署这些独立脚本。
+- **主动握手探测**：NAT 出口机的 `nat.sh` 支持为各 Peer 发送定时数据探测包。该功能与 V4 的 Watchdog 握手时间修复不同；只更新 VPS 的 V4 不会替旧 Peer 自动创建 NAT 端探测定时器。
+- **生产升级提示**：优先做 VPS 快照和节点状态备份；在维护窗口升级，并确认回滚方法。安装 V4 管理模块可能刷新 nftables 规则与 systemd 定时器；无需为安装 V4 而重新创建现有节点或重新运行 WG 的 `init/add`。服务商按一小时平均 CPU 考核时，三分钟测量只能参考，不能代替完整一小时统计。
+
+## 正式端口限速版：通用 `portbw`（2026-10-18）
+
+- 适用于 Debian/Ubuntu + systemd，不限 Helan；`portbw-install.sh` 与 `portbw.py` 是正式配套文件，使用本仓库 `main` 的两条 `curl` 命令下载后，**必须继续执行 `check` 和 `install` 才真正安装。仅下载、`bash -n` 或 `check` 不会创建 `portbw` 命令。
+- 常驻 Watchdog 取代旧版每秒启动的 timer，双向独立自动触发；修复 TCP 上/下行 policer burst 过小导致的实际吞吐下降，并改进 100% 阈值附近的持续负载判定。**触发阈值仍为用户设置的 100%，85% 只用于判断样本持续性，不是把触发阈值降低到 85%。**
+- 曾在 2 vCPU、13 端口的 `vm-172` 上测得 Watchdog 五分钟单核 CPU 由旧版至少 14.916% 降至新版 4.306%；实际效果与端口、流量及服务器环境有关。相同源码也在 Helan 验证了下载/上传触发及恢复。此版**不会自动给任何端口创建限速策略**。
+- `check` 和 `verify` 为只读诊断；`install`、`upgrade`、`rollback` 会修改系统，请先做 VPS 快照。仅支持受本系列安装器管理、记录和源码 SHA 一致的旧版原地升级；从其他仓库安装的旧版请按下方迁移说明操作。所有命令**直接通过单词执行，不询问 1/2/3/4 数字选项**。
+
+## 使用前准备
+
+- Debian 11+ 或 Ubuntu 20.04+
+- `root` 用户、systemd 环境
+- 一个 A 记录指向 VLESS VPS 公网 IPv4 的域名
+- 创建 IPv6 临时节点时，再准备一个 AAAA 记录指向该 VPS 的域名
+- 放行主节点 TCP 端口（默认 `443`）、临时节点 TCP 端口（默认 `40000-50050`）
+- 使用 WG-NAT 时，放行 VLESS VPS 的 UDP `51820`
+
+## 一、安装 VLESS 主节点
+
+### 1. 安装
+
+在 **VLESS VPS** 执行：
+
+```bash
+apt-get update && apt-get install -y curl ca-certificates && bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vless.sh')
+```
+
+### 2. 修改配置
+
+```bash
+nano /etc/default/vless-reality
+```
+
+参考配置：
+
+```bash
+PUBLIC_DOMAIN=proxy.example.com
+PUBLIC_IPV6_DOMAIN=
+CAMOUFLAGE_DOMAIN=www.apple.com
+REALITY_DEST=www.apple.com:443
+REALITY_SNI=www.apple.com
+PORT=443
+NODE_NAME=VLESS-REALITY-IPv4
+```
+
+通常只需要修改：
+
+- `PUBLIC_DOMAIN`：A 记录必须指向当前 VPS
+- `PUBLIC_IPV6_DOMAIN`：仅创建 IPv6 临时节点时填写
+- `PORT`、`NODE_NAME`：按需修改
+
+脚本默认伪装目标是 `www.apple.com`。需要更换时，请同时修改 `CAMOUFLAGE_DOMAIN`、`REALITY_DEST` 和 `REALITY_SNI`。
+
+### 3. 创建或更新主节点
+
+```bash
+bash /root/onekey_reality_ipv4.sh
+```
+
+主节点链接：
+
+```bash
+cat /root/vless_reality_vision_url.txt
+```
+
+修改配置后重新执行主节点脚本即可。默认会保留原 UUID 和 Reality 密钥。
+
+可选操作：
+
+```bash
+# 固定 Xray 版本
+XRAY_VERSION=vX.Y.Z bash /root/onekey_reality_ipv4.sh
+
+# 重新生成 UUID 和 Reality 密钥（旧链接会失效）
+ROTATE_CREDENTIALS=1 bash /root/onekey_reality_ipv4.sh
+```
+
+## 二、创建临时节点
+
+普通临时节点使用 VLESS VPS 自身出口；WG-NAT 临时节点使用 NAT 出口机的公网 IPv4。两者参数完全相同，只是创建命令不同：
+
+| 节点类型 | 创建命令 |
+|---|---|
+| 普通临时节点 | `vless_mktemp.sh` |
+| WG-NAT 临时节点 | `vless_mktemp_nat.sh` |
+
+> WG-NAT 创建命令需要先完成本文“部署 WG-NAT”部分。
+>
+> `id` 是可选参数，省略后脚本会自动生成节点名称。手动填写时只支持英文字母、数字、点、下划线和连字符，不支持中文。下面示例均省略 `id`。
+
+命令开头的数字控制有效期，`IP_LIMIT` 是活跃来源 IP 数量，`PQ_GIB` 是双向总流量配额。如果要加id在时间后面加上id="xx"即可。
+
+### 按分钟
+
+普通临时节点：
+
+```bash
+MINUTES=30; IP_VERSION=4 IP_LIMIT=3 PQ_GIB=1 D=$((MINUTES*60)) vless_mktemp.sh
+```
+
+WG-NAT 临时节点：
+
+```bash
+MINUTES=30; IP_VERSION=4 IP_LIMIT=3 PQ_GIB=1 D=$((MINUTES*60)) vless_mktemp_nat.sh
+```
+
+### 按小时
+
+普通临时节点：
+
+```bash
+HOURS=2; IP_VERSION=4 IP_LIMIT=3 PQ_GIB=1 D=$((HOURS*60*60)) vless_mktemp.sh
+```
+
+WG-NAT 临时节点：
+
+```bash
+HOURS=2; IP_VERSION=4 IP_LIMIT=3 PQ_GIB=1 D=$((HOURS*60*60)) vless_mktemp_nat.sh
+```
+
+### 按天
+
+普通临时节点：
+
+```bash
+DAYS=7; IP_VERSION=4 IP_LIMIT=3 PQ_GIB=50 D=$((DAYS*24*60*60)) vless_mktemp.sh
+```
+
+WG-NAT 临时节点：
+
+```bash
+DAYS=7; IP_VERSION=4 IP_LIMIT=3 PQ_GIB=50 D=$((DAYS*24*60*60)) vless_mktemp_nat.sh
+```
+
+### 固定端口
+
+下面示例固定使用端口 `40000`，有效期为 1 小时。
+
+普通临时节点：
+
+```bash
+HOURS=1; IP_VERSION=4 PORT_START=40000 PORT_END=40000 IP_LIMIT=3 PQ_GIB=1 D=$((HOURS*60*60)) vless_mktemp.sh
+```
+
+WG-NAT 临时节点：
+
+```bash
+HOURS=1; IP_VERSION=4 PORT_START=40000 PORT_END=40000 IP_LIMIT=3 PQ_GIB=1 D=$((HOURS*60*60)) vless_mktemp_nat.sh
+```
+
+固定端口时，`PORT_START` 和 `PORT_END` 必须设置为同一个端口。
+
+### 创建 IPv6 入站节点
+
+IPv6 只需改一个参数，按下面两步操作：
+
+1. 在 `/etc/default/vless-reality` 中填写 `PUBLIC_IPV6_DOMAIN`，并确保该域名的 AAAA 记录指向当前 VLESS VPS。
+2. 将上面任意创建命令中的 `IP_VERSION=4` 改成 `IP_VERSION=6`，其他参数不用改。
+
+例如，将：
+
+```bash
+HOURS=2; IP_VERSION=4 IP_LIMIT=3 PQ_GIB=1 D=$((HOURS*60*60)) vless_mktemp.sh
+```
+
+改为：
+
+```bash
+HOURS=2; IP_VERSION=6 IP_LIMIT=3 PQ_GIB=1 D=$((HOURS*60*60)) vless_mktemp.sh
+```
+
+WG-NAT 同样只需把 `IP_VERSION=4` 改成 `IP_VERSION=6`；客户端通过 IPv6 连接 VLESS VPS，出站仍是 NAT 机的公网 IPv4。
+
+常用调整：
+
+- 不限制来源 IP：改为 `IP_LIMIT=0`
+- 不限制流量：删除 `PQ_GIB=...`
+- 修改固定端口：同时修改 `PORT_START` 和 `PORT_END`
+
+创建成功后会直接输出端口、到期时间和节点链接。
+
+## 三、查看与删除节点
+
+### 查看全部节点
+
+```bash
+vless_audit.sh
+```
+
+### 按端口查询节点链接
+
+修改最前面的端口：
+
+```bash
+PORT=40001; MAIN_PORT=$(awk -F= '$1=="PORT"{print $2; exit}' /var/lib/vless-reality/main/main.env /etc/default/vless-reality 2>/dev/null); if [ -n "$MAIN_PORT" ] && [ "$PORT" = "$MAIN_PORT" ]; then [ -s /root/vless_reality_vision_url.txt ] && cat /root/vless_reality_vision_url.txt || { echo "主节点链接文件不存在" >&2; exit 1; }; else mapfile -t files < <(grep -l "^PORT=${PORT}$" /var/lib/vless-reality/temp/*.env 2>/dev/null); [ "${#files[@]}" -eq 1 ] || { [ "${#files[@]}" -eq 0 ] && echo "未找到端口 ${PORT} 的节点" >&2 || echo "端口 ${PORT} 匹配到多个临时节点，请先运行 vless_audit.sh 检查" >&2; exit 1; }; url="${files[0]%.env}.url"; [ -s "$url" ] && cat "$url" || { echo "节点存在，但链接文件不存在：$url" >&2; exit 1; }; fi
+```
+
+### 按端口强制删除临时节点
+
+修改最前面的端口：
+
+```bash
+PORT=40000; mapfile -t files < <(grep -l "^PORT=${PORT}$" /var/lib/vless-reality/temp/*.env 2>/dev/null); [ "${#files[@]}" -eq 1 ] || { [ "${#files[@]}" -eq 0 ] && echo "没找到端口 ${PORT} 对应的临时节点" >&2 || echo "端口 ${PORT} 匹配到多个临时节点，请先运行 vless_audit.sh 检查" >&2; exit 1; }; TAG=${files[0]##*/}; TAG=${TAG%.env}; FORCE=1 /usr/local/sbin/vless_cleanup_one.sh "$TAG"
+```
+
+该命令只删除临时节点，不会删除主节点；普通临时节点和 WG-NAT 临时节点均适用。
+
+### 清空全部临时节点
+
+```bash
+vless_clear_all.sh
+```
+
+## 四、流量与来源 IP 限制
+
+创建节点时可以直接设置 `PQ_GIB`、`IP_LIMIT` 和 `IP_STICKY_SECONDS`，也可以按端口修改：
+
+```bash
+# 设置端口总流量为 50 GiB
+pq_add.sh 40000 50
+
+# 查看全部配额
+pq_audit.sh
+
+# 删除端口配额
+pq_del.sh 40000
+
+# 最多允许 2 个活跃来源 IP，槽位保持 300 秒
+ip_set.sh 40000 2 300
+
+# 删除来源 IP 数量限制
+ip_del.sh 40000
+
+# 手动重置指定临时节点流量并保留原自动重置日期（示例：40000 重置为 100 GiB）
+# 已有重置日期不改变；长期节点若周期被清零则按原创建日期恢复；有效期不超过30天的节点不新增自动重置
+# 执行会清零该端口已用流量，并备份原配额与节点配置；仅修改开头的 PORT 和 GIB 即可换端口与配额
+PORT=40000 GIB=100 bash -c 'set -Eeuo pipefail; source /usr/local/lib/vless-reality/quota-lib.sh; (( EUID == 0 )) || vr_die "请用root执行"; [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )) || vr_die "端口非法"; BYTES="$(vr_parse_gib_to_bytes "$GIB")" || vr_die "流量值非法"; vr_ensure_runtime_dirs; vr_acquire_lock_fd 7 "${VR_LOCK_DIR}/temp.lock" 120 "节点锁繁忙"; export VR_TEMP_LOCK_HELD=1; vr_pq_lock; T="$(vr_temp_meta_by_port "$PORT")"; Q="$(vr_quota_meta_file "$PORT")"; [[ -n "$T" && -f "$T" && -f "$Q" ]] || vr_die "节点或配额不存在"; TAG="$(vr_meta_get "$T" TAG)"; [[ "$(vr_meta_get "$Q" OWNER_KIND)" == temp && "$(vr_meta_get "$Q" OWNER_TAG)" == "$TAG" && "$(vr_meta_get "$Q" PORT)" == "$PORT" ]] || vr_die "配额归属异常"; [[ "$(vr_meta_get "$T" PQ_LIMIT_BYTES)" == "$(vr_meta_get "$Q" ORIGINAL_LIMIT_BYTES)" ]] || vr_die "原始配额不一致"; START="$(vr_meta_get "$T" CREATE_EPOCH)"; DURATION="$(vr_meta_get "$T" DURATION_SECONDS)"; EXPIRE="$(vr_meta_get "$T" EXPIRE_EPOCH)"; INTERVAL="$(vr_meta_get "$Q" RESET_INTERVAL_SECONDS)"; NEXT="$(vr_meta_get "$Q" NEXT_RESET_EPOCH)"; QCREATED="$(vr_meta_get "$Q" CREATED_EPOCH)"; for N in "$START" "$DURATION" "$EXPIRE" "$INTERVAL" "$NEXT" "$QCREATED"; do [[ "$N" =~ ^[0-9]+$ ]] || vr_die "时间配置错误"; done; NOW="$(date +%s)"; (( START > 0 && START <= NOW && EXPIRE > NOW && EXPIRE == START + DURATION )) || vr_die "节点已到期或日期异常"; if (( INTERVAL == 0 && NEXT == 0 )); then if (( DURATION > 2592000 )); then INTERVAL=2592000; NEXT=$((START + ((NOW-START)/INTERVAL+1)*INTERVAL)); fi; elif (( INTERVAL > 0 && NEXT > 0 )); then if (( NEXT <= NOW )); then NEXT=$((NEXT+((NOW-NEXT)/INTERVAL+1)*INTERVAL)); fi; else vr_die "自动重置配置不完整"; fi; BACKUP="$(mktemp -d "/root/pq-keepcycle-${PORT}-XXXXXXXX")"; chmod 700 "$BACKUP"; cp -p "$Q" "$BACKUP/quota.env"; cp -p "$T" "$BACKUP/node.env"; echo "备份完成: $BACKUP"; vr_pq_write_meta "$PORT" "$BYTES" 0 "$BYTES" temp "$TAG" "$DURATION" "$EXPIRE" "$NEXT" "$INTERVAL" "$QCREATED" "$NOW" "$NOW" 1; vr_pq_rebuild_port "$PORT" "$BYTES"; vr_meta_upsert "$T" PQ_LIMIT_BYTES "$BYTES"; vr_meta_upsert "$T" PQ_GIB "$GIB"; vr_meta_upsert "$Q" REBUILD_PENDING 0; vr_pq_unlock; flock -u 7; echo "已重置端口 $PORT 为 $GIB GiB"; if (( INTERVAL > 0 )); then TZ=Asia/Shanghai date -d "@$NEXT" "+下次自动重置: %F %T (北京时间)"; else echo "原本无自动重置，保持无自动重置"; fi; pq_audit.sh | grep -F "┃${PORT}│" || true'
+```
+
+### 按端口查看当前活跃来源 IP
+
+修改最前面的端口，例如查询 `40000`：
+
+```bash
+PORT=40000; source /usr/local/lib/vless-reality/iplimit-lib.sh; vr_il_active_ips "$PORT" | tr ' ' '\n'
+```
+
+输出示例：
+
+```text
+1.2.3.4
+5.6.7.8
+```
+
+这里显示的是该端口当前占用 `IP_LIMIT` 槽位的来源 IP。项目使用 nftables 动态集合记录这些 IP；只要该 IP 持续访问这个端口，对应槽位的超时时间就会刷新。
+
+`IP_STICKY_SECONDS` 控制槽位保留时间，创建节点时默认是 `120` 秒。因此这里的“活跃 IP”表示最近一段时间仍占用槽位的 IP，不一定代表查询这一瞬间 TCP 连接仍处于 `ESTABLISHED` 状态。
+
+如果端口设置为 `IP_LIMIT=0`，不会建立用于 IP_LIMIT 的动态集合，此时上面的命令不会列出来源 IP。
+
+如果需要查看**此刻仍处于 TCP ESTABLISHED 状态**的连接，可以使用：
+
+```bash
+PORT=40000; ss -Htn state established "( sport = :$PORT )"
+```
+
+临时节点删除或到期时，绑定的配额和 IP 限制会一起清理。
+
+创建时设置了 `PQ_GIB` 且有效期严格大于 30 天，配额会每 30 天自动重置。
+
+### 可选：每日流量记录（保留 30 天）
+
+在已经安装 VLESS 的 **VLESS VPS** 上，以 `root` 执行。此功能独立安装，支持主节点、普通临时节点和 WG-NAT 临时节点，包括未设置流量配额的节点；无需重新运行主脚本或重启 Xray。
+
+#### 安装
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
+```
+
+#### 使用方法
+
+```bash
+# 查看所有有效用户今天的流量
+vless_traffic
+
+# 按端口查看某个用户最近 30 个自然日的每日明细
+vless_traffic 40002
+
+# 查看主节点的每日明细（不受主节点端口设置影响）
+vless_traffic main
+
+# 主节点使用 443 端口时，也可以这样查询
+vless_traffic 443
+
+# 按创建时指定的节点 ID 或完整 TAG 查询
+vless_traffic tmp001
+vless_traffic vless-temp-tmp001
+
+# 导出某个用户保留的历史记录，流量单位为字节
+vless_traffic 40002 --json
+```
+
+将示例端口、节点 ID 或 TAG 替换为实际值；可以先运行 `vless_audit.sh` 查看节点。
+
+**默认只显示今天**，每个用户一条记录。到了第二天，昨天的数据仍会保留，但不会挤在默认列表中；指定端口、节点 ID、TAG 或 `main` 才会展开该用户的历史明细。没有历史记录的日期不会补造数据。`--json` 导出完整保留历史，不受默认表格“只显示今天”的限制。
+
+表格自动换算 B、KiB、MiB、GiB 等单位，字段含义如下：
+
+| 字段 | 含义 |
+|---|---|
+| NAME | 节点名称 |
+| PORT | 节点端口 |
+| DATE | 北京时间日期 |
+| UP | 用户当天上传流量 |
+| DOWN | 用户当天下载流量 |
+| TOTAL | 当天上传与下载合计，不是节点累计用量或剩余配额 |
+
+#### 保留与清理规则
+
+- 按**北京时间（UTC+8）**分日，保留今天和前 29 个自然日，采集时自动删除超出范围的日期。
+- 正常每分钟采集一次，运行查询命令时也会采集。
+- 用户到期、主动删除或清空临时节点后，下一次成功采集清理时自动删除对应的全部流量历史，正常情况下约 1 分钟内完成。
+- 同名重建节点或复用端口时，新用户不会继承旧用户的记录。
+- 记录独立于流量配额；调整、删除或重置配额不会重置每日流量记录。
+- 数据保存在 `/var/lib/vless-reality/traffic/daily.json`，更新统计脚本和重启服务器会保留已保存的记录，仍按上述规则自动清理。
+
+从安装启用后开始记录，无法补回安装前的用量。统计按节点/端口归属，多人共用一个节点链接时会合并计算。流量包含 TCP 网络协议开销；每分钟采样的增量计入采样当天，因此跨午夜可能存在采样间隔内的日期归属误差。断电或外部清空统计计数器可能丢失尚未保存的增量。
+
+### 可选：TCP+UDP 同端口共享限速（portbw）
+
+此组件与 VLESS 节点管理、流量统计、WG-NAT 相互独立：**按本机监听端口限速，不绑定节点配置**。TCP 和 UDP 使用同一个端口时，二者在**上传方向合计使用一个额度**，在**下载方向合计使用另一个额度**；IPv4 和 IPv6 也共用各自方向的同一额度，不是每种协议分别限速。实际速度可能因协议开销、丢包和瞬时突发略有波动。
+
+#### 一键查询全部端口限速
+
+```bash
+portbw report           # 一键查看所有静态、自动限速端口（中文单表格，每个端口一行）
+```
+
+查看当前上传/下载、正常速度、自动降速值、触发阈值、持续时间、滚动保护、冷却时间及规则状态，单位为 **Mbps**。静态端口不适用的参数显示 `-`；终端较窄时优先保留限速参数。此命令**只读**，不会改变限速或保护计时。安装 `portbw` 后即可使用。
+
+#### 安装 / 更新 portbw（需要同时下载两个文件）
+
+**干净服务器首次安装（正式版）：** 在要限速的 Debian/Ubuntu 服务器上以 **root** 逐行执行以下完整命令。安装器不自动下载配套 Python 文件，也不自动执行 apt，因此下面的依赖安装、两次下载、只读预检和实际安装都要保留；**不要停在 curl 或 check 那一步**。
+
+```bash
+apt-get update && apt-get install -y curl ca-certificates python3 iproute2 nftables util-linux coreutils procps
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/portbw-install.sh' -o /root/portbw-install.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/portbw.py' -o /root/portbw.py
+bash /root/portbw-install.sh check
+bash /root/portbw-install.sh install
+bash /root/portbw-install.sh verify
+portbw report
+portbw audit
+```
+
+`check` 是只读预检，必须出现 `CHECK PASS`；`install` **才执行实际安装**，须出现 `INSTALL PASS` 和 `VERIFY PASS`；完成后 `command -v portbw` 应显示 `/usr/local/sbin/portbw`，Watchdog 应为 `active`。**如果预检失败，先排查，不要强行安装。** 如需手动指定物理网卡，可先运行 `ip -4 route get 1.1.1.1` 查看，再在 `check` 和 `install` 后分别加 `--iface eth0`（`eth0` 替换为实际的非隧道物理网卡）。首次安装不创建端口规则，请使用后面的 `portbw set` 或 `portbw auto set` 明确设置端口。
+
+**升级已由本系列通用安装器管理的已知 v1/v2/候选版：** 先按上述两条 `curl` 重新下载同一版安装器和源码，先记录当前的 `portbw report` 与 `portbw audit`，保存可恢复的 VPS 快照，再在维护窗口执行（不要重新执行首次安装 `install`）：
+
+```bash
+bash /root/portbw-install.sh preflight-upgrade
+bash /root/portbw-install.sh upgrade
+bash /root/portbw-install.sh verify
+portbw report
+portbw audit
+```
+
+首次安装的 `check` 要求干净环境，已有受管理安装要用 **`preflight-upgrade`**。升级工具只接受有 `/var/lib/portbw-resident-release/current.env` 管理记录，且已安装源码 SHA 与记录一致的受支持旧版；未知来源的旧版即使已有端口配置也**不允许直接覆盖或伪造管理记录**。安装器会持久保存备份，但不能取代 VPS 快照。不要执行 `nft flush ruleset`、`tc qdisc del ... root`，不要停止其他业务的 nft/tc 系统规则。
+#### 静态限速：设置、修改、取消
+
+```bash
+portbw set 40001 10 20  # 40001：TCP+UDP 合计上传 10 Mbps / 合计下载 20 Mbps
+portbw up 40001 15      # 上传上限改为 15 Mbps
+portbw down 40001 30    # 下载上限改为 30 Mbps（直接限速，不是触发阈值）
+portbw down 40001 0     # 仅关闭下载限速；上传额度不变
+portbw show 40001       # 查看单个端口的详细配置和内核状态
+portbw audit            # 专门审计所有限速规则的 nft/tc 生效情况
+portbw del 40001        # 仅取消端口限速，不删除 VLESS 节点
+```
+
+#### 自动限速：双向独立触发与恢复（2026-10-18 常驻版）
+
+以下以端口 `40001` 为例：平时上下行各 30 Mbps；达到本方向上限的 100% 并持续 5 秒后，该方向降至 15 Mbps；滚动保护至少 120 秒（2 分钟），持续高负载会续期；恢复后无冷却。**下列 Bash 数组含中文注释，整段复制即可执行**（不是把中文括号插在命令参数之间）。
+
+```bash
+args=(
+  40001              # 本机监听端口：40001（VLESS 可按实际情况改为 443）
+  --up 30            # 正常上传上限：30 Mbps
+  --down 30          # 正常下载上限：30 Mbps
+  --trigger 100      # 触发阈值：基础速度的 100%，即上传或下载达到 30 Mbps
+  --after 5s         # 达到对应方向阈值并持续 5 秒后，开始降速
+  --auto-up 15       # 上传方向触发后：上传降为 15 Mbps
+  --auto-down 15     # 下载方向触发后：下载降为 15 Mbps
+  --hold 120s        # 滚动保护至少 120 秒，即 2 分钟；持续高负载会续期
+  --cooldown 0s      # 恢复基础速度后零冷却，立即允许再次检测违规
+)
+
+portbw auto set "${args[@]}"  # 应用自动限速；上传和下载分别监测、分别触发
+portbw auto status 40001     # 查看自动限速、采样和滚动保护状态
+```
+
+需要**手动停止自动限速**时，另行执行（不要与上面的设置命令一起执行）：
+
+```bash
+portbw auto off 40001        # 关闭自动模式，恢复基础上传/下载限速
+```
+
+`--trigger 100` 表示**基础速度的 100%**，不是整台服务器总带宽的 100%，也不是 100 Mbps。新版对接近阈值的连续样本使用 85% **连续性判定下界**，但最终持续窗口仍要求达到用户设定的 100% 整体触发门槛，**并非降到 85% 即触发**；不满足条件不会强制降速。`--after 5s` 是在符合连续和窗口条件后触发。`--hold 120s` 是**至少 2 分钟**，持续接近降速上限或持续超限丢包时可滚动续期；`--cooldown 0s` 取消恢复后的冷却，再次降速仍需重新满足触发条件。
+
+自动模式中只有 `--cooldown` 可以省略（省略默认 `60s`，**零冷却必须明确写 `--cooldown 0s`**），其他参数均为必填；上下行基础速度必须分别大于降速值，且均大于 0。`--trigger` 必须填写，单位为百分比（可填 100），不是 Mbps。`portbw down 40001 30` 只会直接改成**静态下载限速 30 Mbps**，不会设置自动触发门槛，且手动修改会关闭该端口的自动模式。
+
+`0` 表示对应方向**不限速**；两个方向都无需限速时用 `portbw del <端口>`。限速覆盖本机进入/离开的 TCP、UDP 流量，不覆盖任意 WireGuard/NAT `FORWARD` 转发流量；上传由 nftables + tc 执行限速，下载使用 tc egress 的单个共享 policer，nftables 负责计数（避免 OUTPUT 超限导致 UDP 程序 `Operation not permitted`）。`--nft-only` 不支持下载限速，请使用默认的 nft+tc 模式以获得完整双向限速。
+
+#### 查询自动限速日志（默认北京时间）
+
+以下查询命令**默认按北京时间（UTC+8）输出**，无需修改 VPS 的系统时区。命令只读取已有 systemd 日志，不会改变限速设置。日志时间与服务器本身使用 UTC 还是北京时间无关。
+
+查看最近24小时**所有端口**的自动降速、恢复基础速度和故障记录：
+
+```bash
+TZ=Asia/Shanghai journalctl -u portbw-watch.service \
+  --since '24 hours ago' --no-pager -o short-iso \
+  | grep -E '自动降速|恢复基础速度|失败|Error|Traceback' \
+  || echo '最近24小时没有匹配的降速、恢复或报错日志'
+```
+
+查看最近24小时**指定端口**的自动降速与恢复记录（修改 `PORT=40002` 即可）：
+
+```bash
+PORT=40002
+TZ=Asia/Shanghai journalctl -u portbw-watch.service \
+  --since '24 hours ago' --no-pager -o short-iso \
+  | grep -E "${PORT} (up|down): (自动降速|恢复基础速度)" \
+  || echo "最近24小时端口 ${PORT} 没有降速或恢复记录"
+```
+
+查看**指定端口的全部尚存历史记录**，不局限于最近24小时：
+
+```bash
+PORT=40002
+TZ=Asia/Shanghai journalctl -u portbw-watch.service \
+  --no-pager -o short-iso \
+  | grep -E "${PORT} (up|down): (自动降速|恢复基础速度)" \
+  || echo "端口 ${PORT} 没有尚存的降速或恢复历史记录"
+```
+
+其中 `up` 表示上传方向，`down` 表示下载方向。日志可能包含参数修改**之前**的历史记录；例如旧版显示 `自动降速 15 Mbps / 恢复基础速度 30 Mbps`，不代表现在仍使用旧限速。**当前配置请以 `portbw report` 和 `portbw audit` 为准。** 没有触发日志，也不代表基础限速失效；历史保存时长受 `systemd-journald` 的自动轮替、磁盘容量和保留策略影响。
+
+**其他旧仓库/无管理记录版本的迁移（不能直接 `install`/`upgrade`）：** 特别是 `zuizhongheji` 等独立旧版及使用旧 tc flower 槽位的机器，先记录每个端口的**基础上/下行、降速上/下行、触发百分比、持续秒数、滚动保护、冷却**，执行 `portbw report` 与 `portbw audit` 并制作 VPS 快照。只可在维护窗口按照确切旧版校验过的迁移工具或逐端口安全删除方法移除旧限速，再安装此通用版并重新添加规则；在删除到重建期间可能暂时失去限速保护。不要把普通安装器用于未知来源旧版本，更不要手动清空整个 nftables ruleset、网卡 root qdisc 或其他业务规则。
+
+
+## 五、部署 WG-NAT
+
+WG-NAT 让 VLESS VPS 上的指定临时节点通过另一台机器的公网 IPv4 出口访问互联网。
+
+### 1. 初始化 NAT 出口机
+
+在 **NAT 出口机** 执行：
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
+```
+
+无法识别公网网卡时：
+
+```bash
+WAN_IF=eth0 bash /root/nat.sh init
+```
+
+### 2. 配置 VLESS VPS
+
+在 **VLESS VPS** 执行：
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
+```
+
+脚本会输出 VPS WireGuard 公钥。以后忘记时，在 **VLESS VPS** 查询：
+
+```bash
+cat /etc/wireguard/wg-nat.pub
+```
+
+### 3. 在 NAT 机添加 VPS
+
+在 **NAT 出口机** 执行：
+
+```bash
+bash /root/nat.sh add hy2 hy2.example.com '这里替换成VPS公钥'
+```
+
+这条命令中的三个参数分别是：
+
+- `hy2`：这台 VLESS VPS 在 NAT 机上的名称，可自行改成 `vps1`、`hk1` 等；以后查看、更新和删除都使用这个名称。
+- `hy2.example.com`：VLESS VPS 的公网 IPv4 域名，也可以直接填写公网 IPv4。
+- `'这里替换成VPS公钥'`：在 VLESS VPS 执行 `cat /etc/wireguard/wg-nat.pub` 得到的公钥。
+
+NAT 机会自动分配 WG 地址，并打印一条完整的 VPS 回填命令；**使用包含 Peer 探测功能的新版 `nat.sh` 执行 `add` 时**，还会尝试自动为本次新增/更新的 Peer 启用探测定时器（需安装 `ping`，且启动 systemd timer 成功）。如果探测启用失败，Peer 本身仍可能创建成功，请检查警告。**已经存在的旧 Peer 不会因为仅更新脚本文件或 VPS 的 V4 就自动启用探测**，可参考第九节的 `probe-enable`。**共享 NAT 注意：`add` 会重启整个 WG 接口，其他 VPS 可能短暂断线，请选择维护窗口。**
+
+### 4. 回到 VPS 执行回填命令
+
+原样执行 NAT 机输出的命令。输出丢失时，可以重新执行上一步同名的 `nat.sh add`，NAT 机会再次打印回填命令。
+
+忘记 NAT 出口机公钥时，在 **NAT 出口机** 查询：
+
+```bash
+cat /etc/wireguard/wg-exit.pub
+```
+
+回填完成后检查出口：
+
+```bash
+/usr/local/sbin/wg_nat_healthcheck.sh
+```
+
+出现以下结果后再继续：
+
+```text
+OK EXIT_IP=x.x.x.x
+```
+
+### 5. 安装 WG-NAT 临时节点工具
+
+在 **VLESS VPS** 执行：
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
+```
+
+### NAT 出口机管理
+
+以下命令都在 **NAT 出口机** 执行。
+
+#### 查看已经添加的 VPS
+
+```bash
+bash /root/nat.sh list
+```
+
+先用这条命令查看每台 VPS 的名称。后面的 `hy2` 必须替换成这里显示的实际名称。
+
+#### 查看完整运行状态
+
+```bash
+bash /root/nat.sh status
+```
+
+用于查看 WireGuard 接口、所有 VPS Peer、Endpoint 和握手状态。连接异常时先执行这条命令。
+
+#### 删除某台 VPS 的 NAT 接入记录
+
+例如删除名称为 `hy2` 的 VPS：
+
+```bash
+bash /root/nat.sh del hy2
+```
+
+`hy2` 只是示例。删除前先执行 `bash /root/nat.sh list`，复制需要删除的实际名称。删除时会停用对应探测，但会重启整个 WG 接口，其他 VPS 可能短暂断线。
+
+#### 更新 VPS 的域名、IP 或公钥
+
+使用与原来相同的名称再次执行 `add`：
+
+```bash
+bash /root/nat.sh add hy2 hy2.example.com '当前VPS公钥'
+```
+
+同名 `add` 会更新该 VPS 的连接信息，并保留原来分配的 WG 地址；更新时整个 WG 接口仍会重启。VPS 公钥可在 VLESS VPS 执行以下命令重新查询：
+
+```bash
+cat /etc/wireguard/wg-nat.pub
+```
+
+#### 忘记公钥时
+
+```bash
+# 在 VLESS VPS 查询 VPS 公钥
+cat /etc/wireguard/wg-nat.pub
+
+# 在 NAT 出口机查询 NAT 公钥
+cat /etc/wireguard/wg-exit.pub
+```
+
+## 六、更新脚本
+
+> **更新范围必须区分**：运行 `vless.sh` 仅刷新 VLESS 侧相关管理组件；NAT 出口机的 `/root/nat.sh`、VPS 侧 `vpswg.sh` 与 `natjichang.sh` 需要分别管理。GitHub 上的 `main` 更新不会自动修改 VPS 硬盘里的旧脚本。生产环境建议固定已验收的提交 URL，而不是每次自动跟随 `main`。
+
+### VLESS 管理工具
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vless.sh' -o /root/vless.sh && chmod 700 /root/vless.sh && bash /root/vless.sh
+```
+
+需要更新 Xray 主程序或重新应用主配置时：
+
+```bash
+bash /root/onekey_reality_ipv4.sh
+```
+
+### 每日流量统计
+
+已安装统计组件时，在 **VLESS VPS** 重新执行以下命令即可更新：
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/traffic.py' -o /root/vless_traffic.py && python3 /root/vless_traffic.py --install
+```
+
+无需删除历史数据，也无需重新安装主脚本。更新后运行 `vless_traffic`，标题应显示“今日”；运行 `vless_traffic main` 可查看主节点保留的每日明细。
+
+### VLESS VPS 的 WG-NAT 工具
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/vpswg.sh' -o /root/vpswg.sh && chmod 700 /root/vpswg.sh && bash /root/vpswg.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/natjichang.sh' -o /root/natjichang.sh && chmod 700 /root/natjichang.sh && bash /root/natjichang.sh
+```
+
+### NAT 出口机
+
+**只核对是否已是最新版（只读、不重启 WG）：**
+
+```bash
+sha256sum /root/nat.sh
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' | sha256sum
+```
+
+两行 SHA256 一样就无需重复下载或初始化。不同则先确认当前脚本的来源和改动；**仅更新管理脚本文件，不等于执行 `init`，也不会自动为旧 Peer 启用探测**。如果目的是给既有 Peer 补上探测，请使用第九节的 `probe-status`/`probe-enable`，不要为此运行会影响所有 WG Peer 的 `init` 或 `add`。
+
+**旧 NAT 机升级前先备份：** 在 NAT 出口机执行以下命令（备份包含 WG 私钥，切勿公开上传），然后安排维护窗口：
+
+```bash
+umask 077
+mkdir -p /root/wg-backups
+BACKUP_TS=$(date +%Y%m%d-%H%M%S)
+tar -C /etc -czf "/root/wg-backups/wireguard-${BACKUP_TS}.tar.gz" wireguard
+iptables-save > "/root/wg-backups/iptables-${BACKUP_TS}.rules"
+```
+
+**只有明确需要重新初始化或迁移 NAT 端 WG 配置时**，才在维护窗口执行以下命令；它会更新管理脚本并重新初始化 WG，可能造成共用出口所有 Peer 短暂中断：
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/nat.sh' -o /root/nat.sh && chmod 700 /root/nat.sh && bash /root/nat.sh init
+```
+
+## 七、常见排查
+
+### 主节点
+
+```bash
+systemctl status xray.service
+TZ=Asia/Shanghai journalctl -u xray.service -n 120 --no-pager
+```
+
+### 临时节点、配额或规则异常
+
+```bash
+vless_restore_all.sh
+vless_audit.sh
+pq_audit.sh
+```
+
+### 按端口查看临时节点日志
+
+```bash
+PORT=40000; mapfile -t files < <(grep -l "^PORT=${PORT}$" /var/lib/vless-reality/temp/*.env 2>/dev/null); [ "${#files[@]}" -eq 1 ] || { echo "无法唯一找到端口 ${PORT} 对应的临时节点" >&2; exit 1; }; TAG=${files[0]##*/}; TAG=${TAG%.env}; TZ=Asia/Shanghai journalctl -u "${TAG}.service" -n 100 --no-pager
+```
+
+### 每日流量统计
+
+```bash
+systemctl status vless-traffic.timer vless-traffic-shutdown.service
+TZ=Asia/Shanghai journalctl -u vless-traffic.service -n 50 --no-pager
+```
+
+定时器负责每分钟触发采集，采集服务执行完成后退出属于正常行为。若默认查询仍显示多天数据，请先按“更新脚本”中的每日流量统计命令更新。
+
+### 域名解析
+
+```bash
+getent ahostsv4 proxy.example.com
+curl -4 https://api.ipify.org
+
+getent ahostsv6 proxy6.example.com
+ip -6 addr show scope global
+```
+
+### WG-NAT
+
+```bash
+/usr/local/sbin/wg_nat_healthcheck.sh
+```
+
+仍有问题时，在 NAT 出口机执行：
+
+```bash
+bash /root/nat.sh status
+```
+
+## 八、可选：独立 SOCKS5 代理（3proxy）
+
+在**单独的家宽主机**上用 `root` 安装，与 VLESS VPS 分开。Debian 12 已完成真机验收；Debian 13 和 Ubuntu 22.04/24.04 LTS 在代码依赖上可能兼容，但尚未完成真机验收。
+
+### 1. 安装 / 更新
+
+在家宽主机执行（安装新版不会主动清空已有账号；更新时可能短暂影响连接）：
+
+```bash
+apt-get update && apt-get install -y curl ca-certificates
+AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/socks5-install.sh') install
+```
+
+主机位于路由器 NAT 后面时，可以在 `install` 后加 `--host proxy.example.com`（换成自己的公网域名/IP）。必要时加 `--wan-if eth0` 指定物理出口网卡。
+
+### 2. 创建临时账号（最后一行直接输出 SOCKS5 连接链接）
+
+命令直接修改数字：`IP_LIMIT`=最多来源 IP 数量；`IP_STICKY_SECONDS`=来源 IP 闲置占位时长（秒）；`PQ_GIB`=上传+下载合计总配额（GiB）。持续活动的 IP 会刷新占位时间，超时后释放名额，不是强制断开已建立连接。
+
+#### 按分钟
+
+创建有效期 **30 分钟**、最多 **1 个来源 IP**、**IP 占位 60 秒（1 分钟）**、总配额 **1 GiB** 的账号：
+
+```bash
+MINUTES=30; IP_LIMIT=1 IP_STICKY_SECONDS=60 PQ_GIB=1 D=$((MINUTES*60)) socks5 add
+```
+
+#### 按小时
+
+创建有效期 **2 小时**、最多 **2 个来源 IP**、**IP 占位 300 秒（5 分钟）**、总配额 **5 GiB** 的账号：
+
+```bash
+HOURS=2; IP_LIMIT=2 IP_STICKY_SECONDS=300 PQ_GIB=5 D=$((HOURS*3600)) socks5 add
+```
+
+#### 按天
+
+创建有效期 **7 天**、最多 **3 个来源 IP**、**IP 占位 600 秒（10 分钟）**、总配额 **50 GiB** 的账号：
+
+```bash
+DAYS=7; IP_LIMIT=3 IP_STICKY_SECONDS=600 PQ_GIB=50 D=$((DAYS*86400)) socks5 add
+```
+
+#### 指定固定端口
+
+创建有效期 **1 小时**、最多 **1 个来源 IP**、**IP 占位 60 秒**、总配额 **1 GiB**、监听端口 `41004` 的账号：
+
+```bash
+HOURS=1; IP_LIMIT=1 IP_STICKY_SECONDS=60 PQ_GIB=1 PORT=41004 D=$((HOURS*3600)) socks5 add
+```
+
+省略 `PORT` 自动选择本机空闲端口；`IP_LIMIT=0` 不限制来源 IP；删除 `PQ_GIB=...` 表示不限总配额。创建时可选 `id=myproxy` 自定义内部 ID，但**日常命令直接使用端口即可，不用记 ID**。
+
+家宽主机在路由器后面时，需要把公网 **TCP** 端口映射到本机 SOCKS5 监听端口。若外部端口与本地端口不同，例如外部 `51004` 映射到本机 `41004`：
+
+```bash
+HOURS=1; IP_LIMIT=1 IP_STICKY_SECONDS=60 PORT=41004 D=$((HOURS*3600)) socks5 add --host proxy.example.com --public-port 51004
+```
+
+**重要：下面管理命令使用的是本机监听端口 `41004`，不是路由器映射的外部端口 `51004`。**
+
+### 3. 按端口查看账号、剩余流量和连接链接
+
+日常查看使用 `socks5 list` 即可，一张表看清端口、流量余额、IP 占用、剩余有效期和防护状态。
+
+```bash
+socks5 list                         # 查看全部账号的对齐表格（含实时剩余流量及 IP 占用）
+socks5 quota 41004                  # 查看端口 41004 的总配额、已用、剩余及精确字节数
+socks5 link 41004                   # 获取端口 41004 的完整 socks5:// 连接链接
+socks5 show 41004 --credentials     # 查看账号详细信息、用户名和密码（JSON）
+socks5 status                       # 查看出口网卡、路由与代理服务状态
+socks5 watch                        # 手动检查并恢复防护规则或异常服务
+```
+
+表格说明：`LIMIT`=总配额，`USED`=已用，**`LEFT`=实时剩余额度**，`USE%`=使用比例，`TTL`=剩余有效期，`EXPIRE(BJ)`=北京时间到期日期，`IP占用`=当前有效占位 IP 数/允许上限（例如 **2/3** 表示最多允许 3 个来源 IP，目前占用了 2 个名额），`STICKY`=IP 停止活动后的占位释放秒数。若实时 nftables 计数无法读取，`LEFT` 会显示 **未知**，不会把缓存值误当实时余额。**IP占用统计的是仍在占位期内的不同来源 IP，不是实时建立的 TCP 连接数；读取失败显示 ?/上限，而不是错误显示为零。** 窄终端会隐藏部分列，精确字节数请用 `socks5 quota 41004`。
+
+`socks5-traffic` 每日统计**不等于**总流量配额；剩余可用配额以 `socks5 quota` 查询为准。
+
+### 4. 按端口修改、删除账号
+
+```bash
+socks5 ip-show 41004                # 查看当前占位数量、具体来源 IP 和剩余占位时间
+socks5 ip-set 41004 2 60            # 最多 2 个来源 IP，闲置占位 60 秒（重置已有占位记录）
+socks5 ip-del 41004                 # 取消来源 IP 数量限制
+socks5 pq-set 41004 5 --confirm-reset  # 重新设置 5 GiB 总配额，已用量从零开始
+socks5 pq-del 41004                 # 取消总配额（不限流量）
+socks5 del 41004                    # 删除本机端口 41004 对应的 SOCKS5 账号
+```
+
+为兼容旧版，也可以继续输入创建时返回的账号 ID。
+
+### 5. 可选：每日流量历史（最近 30 天）
+
+```bash
+socks5-traffic --install            # 首次开启或更新每日流量采集
+socks5-traffic                      # 查看所有端口今天的上传/下载用量
+socks5-traffic 41004                # 查看端口 41004 最近 30 天的每日用量
+```
+
+每日统计按约每分钟采样的增量记录；不能把每日流量直接当作实时剩余配额。
+
+### 6. 可选：SOCKS5 端口限速
+
+SOCKS5 与 VLESS 使用**同一套独立 `portbw` 限速方法**，无需重复设置命令。请在**实际运行 SOCKS5 的家宽主机**按照前文“可选：TCP+UDP 同端口共享限速（portbw）”安装并设置；把示例里的 `40001` 改成 SOCKS5 的**本机监听端口**（如 `41004`），即可使用相同的静态限速或 **30→15 Mbps、100% 持续 5 秒、滚动保护 120 秒、零冷却**的自动限速。查询所有端口时，同样使用前文的 `portbw report`。
+
+**注意：** 如果路由器把公网端口 `51004` 映射到家宽主机的 `41004`，限速应设置在本机端口 **`41004`**，不是公网端口 `51004`。SOCKS5 仅支持 TCP CONNECT，不支持 UDP ASSOCIATE；`portbw` 独立按本机端口管理 TCP+UDP。SOCKS5 账号创建、到期、删除均不会自动增删 `portbw` 规则；升级 `portbw` 也不会修改 SOCKS5 账号、配额和服务。已安装非本系列管理的旧版 `portbw` 的主机先参考前文“其他旧仓库/无管理记录版本的迁移”安全迁移；已有受管理版本按 `preflight-upgrade` / `upgrade` 操作。
+
+### 7. SOCKS5 访问日志审计（按本机端口查询）
+
+本功能在 3proxy 连接结束并记账时写入各端口独立的 systemd journal。**原有四项报表保持不变**；新增两个只读查询，不会修改代理、连接限制、流量配额、IP 防护、portbw 限速或 VLESS/WG 配置。
+
+```bash
+# 原有四项：完整主机域名 Top 20、来源 IP 历史 Top 20、同一分钟不同来源 IP、当前 TCP 连接
+socks5 access 40002 7
+
+# 新增：列出全部成功连接的原始主机域名及次数，不限制为前 20 名
+socks5 access-domains 40002 7
+
+# 新增：所有非零错误码的汇总次数，以及最近 50 条错误的时间/IP/目标明细
+socks5 access-errors 40002 7
+
+# 只改变错误明细显示数量；错误码统计依然覆盖全部查询时段
+socks5 access-errors 40002 7 --limit 200
+
+# 显示全部非零错误连接明细（高流量端口可能输出很长）
+socks5 access-errors 40002 7 --all
+
+# 原有的服务与防护审计命令依然可用，不等于访问日志审计
+socks5 audit 40002
+```
+
+上面 `40002` 是 **SOCKS5 本机监听端口**，不是路由器映射的公网端口；`7` 是过去 7 天，可设置为 **1～90 天**。日志时间均按**北京时间**显示。原四项只对成功连接（3proxy 返回码 `00000`）计数；域名查询只对客户端明确使用主机域名的成功代理连接计数，不合并 CNN、Google 等子域名，也不自动排除 CDN/广告域名。错误详情独立报告，不能仅凭错误码或域名推断租客恶意行为或侵权行为。
+
+只有日志开启之后、仍保存在 journald 中且已经记录的连接才能查到；未保存的历史无法补查。3proxy 日志通常在连接结束时出现，因此记录次数不是打开网页的次数；直接通过 IP 发起的连接无法反推出域名。
+
+**更新现有 SOCKS5 管理器（建议先做 VPS 快照；升级期间已有 3proxy 实例可能短暂重启）：**
+
+```bash
+AUTO_DEPS=1 bash <(curl -fsSL 'https://raw.githubusercontent.com/liucong552-art/jieshu/main/socks5-install.sh') update
+```
+
+初次部署请使用本节“1. 安装 / 更新”的 `install` 命令。日志采集使用每个 SOCKS5 实例自己的 journal，不改变其他端口的记录；`socks5-traffic` 每日统计和 `portbw` 限速按原章节独立管理。
+
+## 九、V4 正式版运行规则及生产升级注意事项
+
+- **临时节点看门狗：** 连续第三次恢复失败后启动持久化的 72 小时宽限；宽限期内恢复健康，原 UUID、端口、到期时间不变，并取消倒计时。
+- **宽限届满：** 最终重试依旧失败就按规则删除临时节点，即使当时 NAT 出口整体不可达也不豁免。自然到期节点按正常到期规则清理。
+- **V4 CPU 批量优化与 WG 握手时间修复：** 已包含在正式版 `vless.sh`。它们不会替 NAT 出口机执行 `probe-enable`，也不保证把所有断线都归因于 Watchdog；发现问题请先比对 WG 握手、路由、Xray 服务和 Watchdog 日志。
+- **NAT 主动探测：** 新版 `nat.sh` 在新增/更新 Peer 成功后会*尝试*启用该 Peer 的 systemd 定时器，正常情况下约每 10 秒发送一次普通 WG 内网探测包（不是每 10 秒强制产生一次加密握手）。依赖 `ping`，且 timer 启动必须成功；安装文件、成功创建 Peer、实际启用 timer 是三个不同状态。删除 Peer 会尝试停用对应探测。以前就存在的旧 Peer，不会因只更新 GitHub 或执行 VPS 端 `vless.sh` 而自动开启。
+- **Peer 身份与地址：** `hy2`、`helan` 等是 NAT 管理员自行取的名称，**不能**单凭名字判断是哪台 VPS。启用探测前应核对 `/etc/wireguard/wg-exit-peers.d/<name>.peer` 的 `PublicKey`/`AllowedIPs`，与目标 VPS 的 `wg show wg-nat` 相匹配；避免把探测发给错误的 Peer。
+- **生产 NAT：** `nat.sh init/add/del` 均可能重启整条 WG 接口，影响其他 VPS；必须备份、安排维护窗口并确认回滚方法，不可当作无中断热更新。
+
+### 单独查看或控制某台 VPS 的探测（可选）
+
+下列命令在 **NAT 出口机** 执行。先运行 `bash /root/nat.sh list` 确认名称，把示例 `hy2` 换成实际 Peer 名：
+
+```bash
+bash /root/nat.sh probe-once hy2        # 立即发送一次探测
+bash /root/nat.sh probe-status hy2      # 查看探测定时器
+bash /root/nat.sh probe-enable hy2      # 手动为旧 Peer 开启探测
+bash /root/nat.sh probe-disable hy2     # 手动停止指定 Peer 探测
+```
+
+上述探测命令本身不会重启 `wg-quick` 或修改其他 Peer 的密钥、Endpoint、WG 路由和防火墙；但 `probe-enable` **会**创建/启用对应的 systemd 探测任务。添加 Peer 时仅在自动启用成功的情况下才无需再执行 `probe-enable`。对于历史 Peer，可在确认映射后单独执行，无需重跑 `nat.sh add`。
+
+**确认探测确实在运行（示例名称 `hy2`，NAT 机执行）：**
+
+```bash
+systemctl is-enabled vr-wg-wg-exit-peer-probe@hy2.timer
+systemctl is-active vr-wg-wg-exit-peer-probe@hy2.timer
+journalctl -u vr-wg-wg-exit-peer-probe@hy2.service -n 30 --no-pager
+wg show wg-exit latest-handshakes
+```
+
+`WG_PROBE_SENT` 只代表程序*尝试发送*了数据探测包，不代表对端已收到或真正握手成功；还需要结合实际握手时间和客户端连通性检查。无业务流量时握手时间不一定每 10 秒改变，WireGuard 会按协议需要协商新密钥。
+
+---
+
+请仅在自己拥有或获得授权的服务器和网络环境中使用，并遵守所在地法律、服务商条款和网络使用规定。
+## 十、临时封禁 / 解封单个 VLESS 端口（删除后无残留）
+
+在**运行该 VLESS 节点的服务器**（例如 `MEGABOX`）以 root 身份执行。**下面三条命令互相独立，每次只改各自的 `PORT=40022` 数字即可。** 不需要安装脚本，也不创建配置文件。
+
+本功能同时封禁**外部 IPv4 / IPv6 的 TCP / UDP 入站**（四种组合）；`lo` 回环流量不拦截。采用每个端口独立的 `inet pause_vless_端口` 临时表，不停止或重启 Xray、WG、systemd，不修改 UUID、配额、IP_LIMIT、已有流量统计或其他端口的规则。**仅处理发往本机的 INPUT 流量**，不处理 FORWARD 转发端口或从本机主动发起的出站连接。
+
+### 1. 临时封禁（只改 PORT）
+
+```bash
+(
+PORT=40022
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
+T="pause_vless_$PORT"
+if ! nft list table inet "$T" >/dev/null 2>&1; then
+  nft -f - >/dev/null 2>&1 <<EOF
+add table inet $T
+add chain inet $T input { type filter hook input priority -20; policy accept; }
+add rule inet $T input iifname != "lo" tcp dport $PORT reject with tcp reset
+add rule inet $T input iifname != "lo" udp dport $PORT drop
+EOF
+fi
+R=$(nft list chain inet "$T" input 2>/dev/null) || R=""
+if grep -Fq "iifname != \"lo\" tcp dport $PORT reject with tcp reset" <<<"$R" &&
+   grep -Fq "iifname != \"lo\" udp dport $PORT drop" <<<"$R"; then
+  echo "✅ $PORT 已临时封禁（IPv4 + IPv6 + TCP + UDP）"
+else
+  echo "❌ $PORT 封禁失败或存在旧版规则；如存在旧版临时表，请先执行第 2 条解封，再重试"
+  exit 1
+fi
+)
+```
+
+### 2. 解除封禁（只改 PORT，删除本功能的整张表）
+
+```bash
+(
+PORT=40022
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
+T="pause_vless_$PORT"
+if nft list table inet "$T" >/dev/null 2>&1; then
+  nft delete table inet "$T" >/dev/null 2>&1
+fi
+if nft list table inet "$T" >/dev/null 2>&1; then
+  echo "❌ $PORT 解封失败，临时封禁表仍存在"
+  exit 1
+else
+  echo "✅ $PORT 已解封，临时表、链、规则均已删除"
+fi
+)
+```
+
+### 3. 查询封禁状态（只改 PORT，只输出中文结果）
+
+```bash
+(
+PORT=40022
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || { echo "❌ 端口无效"; exit 1; }
+T="pause_vless_$PORT"
+R=$(nft list chain inet "$T" input 2>/dev/null) || R=""
+if grep -Fq "iifname != \"lo\" tcp dport $PORT reject with tcp reset" <<<"$R" &&
+   grep -Fq "iifname != \"lo\" udp dport $PORT drop" <<<"$R"; then
+  echo "✅ $PORT 已封禁（IPv4 + IPv6 + TCP + UDP）"
+else
+  echo "❌ $PORT 未完整封禁（或没有临时封禁规则）"
+fi
+)
+```
+
+**无残留说明：** 解除封禁会删除这个端口专属的 nftables 表以及其中全部链和规则，不产生本功能的配置文件、定时任务或后台进程。命令本身仍可能留在 Bash history；已有 TCP 连接在内核中的状态、系统日志不会因此自动清除。
+
+**注意：** 本功能只检查其专属临时规则，不能替代外部网络连通性测试。解除后若还有其他防火墙规则，端口仍可能无法访问；封禁时服务显示 `active`、端口显示 `LISTEN` 是正常的。临时规则不设到期时间，通常在重启或防火墙规则重载后失效。若端口存在之前创建的旧版 IPv4-only 临时表，第 1 条不会擅自覆盖；先用第 2 条删除旧表，再执行第 1 条重新封禁即可。
+
+## 十一、指定端口永久拉黑 / 解封（单 IP、CIDR 网段混合批量）
+
+在需要封禁的 Debian 12 服务器上以 root 身份执行。无需下载、安装或修改管理脚本；每条命令都是**单行命令**。只需修改最前面的 **P=40001**（本机目标端口）和 **IPS="..."**（空格隔开的 IPv4 或 CIDR 网段）。例如 **1.2.3.4**、**27.47.34.0/24**，也可以同时输入。带掩码的地址必须写规范网络地址，如 **27.47.34.0/24**，不要写 **27.47.34.26/24**。IPv4 单地址会规范化为 /32。
+
+新封禁统一使用独立 **inet jsh_cidrban** 表；原 README 使用的 **inet jsh_ipban** 表和现有单 IP 黑名单不受新增封禁影响。两种表的规则都按来源 IPv4 + 目标端口，在 PREROUTING 阶段丢弃 TCP / UDP 流量（DNAT 前）；不针对 IPv6。**这是服务器级别的封禁，不是按 VLESS 用户隔离的功能。** 切勿误填 SSH 管理端口，操作前建议保留已有 SSH 会话。
+
+### 1. 永久拉黑（单 IP / 网段混合，一行）
+
+~~~bash
+P=40001 IPS="1.2.3.4 5.6.7.8 27.47.34.0/24" bash -c 'set -euo pipefail; (( EUID==0 )) || { echo "需root权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P<=65535 )) || { echo "端口无效"; exit 1; }; read -r -a A <<< "$IPS"; (( ${#A[@]} > 0 )) || { echo "IP列表为空"; exit 1; }; NETS=$(python3 -B -c "import ipaddress,sys; [print(ipaddress.IPv4Network(s,strict=True)) for s in sys.argv[1:]]" "${A[@]}"); exec 9>/run/jsh-cidrban.lock; flock -x 9; if ! nft list table inet jsh_cidrban >/dev/null 2>&1; then printf "%s\n" "add table inet jsh_cidrban" "add chain inet jsh_cidrban pre { type filter hook prerouting priority -150; policy accept; }" | nft -f -; fi; for NET in $NETS; do MARK="jshcidr:$P:$NET"; if ! nft -a list chain inet jsh_cidrban pre | grep -Fq "comment \"$MARK\""; then printf "add rule inet jsh_cidrban pre ip saddr %s meta l4proto { tcp, udp } th dport %s counter drop comment \"%s\"\n" "$NET" "$P" "$MARK" | nft -f -; fi; done; umask 077; nft list table inet jsh_cidrban >/etc/jsh-cidrban.nft.tmp; mv -f /etc/jsh-cidrban.nft.tmp /etc/jsh-cidrban.nft; printf "%s\n" "[Unit]" "Description=Jieshu CIDR port blacklist" "After=nftables.service" "Before=network.target" "[Service]" "Type=oneshot" "ExecStart=/usr/sbin/nft -f /etc/jsh-cidrban.nft" "[Install]" "WantedBy=multi-user.target" >/etc/systemd/system/jsh-cidrban.service; systemctl daemon-reload; systemctl enable jsh-cidrban.service >/dev/null; echo "已封禁端口 $P：${A[*]}"'
+~~~
+
+重复运行相同 IP/网段和端口会跳过已有的受管理规则；不同端口可以分别添加。规则保存至 **/etc/jsh-cidrban.nft**，启用 **jsh-cidrban.service** 尝试在重启后恢复。现有 **jsh_ipban** 不会被覆盖。此命令会修改 nftables、防火墙配置与 systemd 状态。
+
+### 2. 一键查询全部黑名单（只读，按端口排序）
+
+~~~bash
+{ nft -n list chain inet jsh_cidrban pre 2>/dev/null | sed -n 's/.*comment "jshcidr:\([0-9][0-9]*\):\([^"]*\)".*/\1 \2/p'; nft -n list set inet jsh_ipban banned 2>/dev/null | awk '/elements =/ {inside=1} inside {gsub(/[{},]/," "); for(i=1;i<=NF-2;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $(i+1)=="." && $(i+2) ~ /^[0-9]+$/) print $(i+2),$i}'; } | sort -k1,1n -k2,2V -u | awk 'BEGIN{print "========== IP黑名单总览 =========="} {if($1!=p){if(NR>1)printf "  小计：%d项\n\n",c; p=$1; c=0; ports++; printf "【端口 %s】\n",p} addr=$2; if(addr ~ /\/32$/)sub(/\/32$/,"",addr); printf "  %-22s %s\n",addr,(index(addr,"/")?"整个网段":"单独IP"); c++; total++} END{if(total){printf "  小计：%d项\n",c}else print "没有查到这两套黑名单的封禁条目"; printf "\n总计：%d个端口，%d项封禁\n",ports,total}'
+~~~
+
+依次显示每个端口的封禁地址、单独 IP / 整个网段和封禁条目小计，并显示总端口数、总条目数。**只读取 nftables 当前规则，不创建文件、不修改防火墙、不清零计数器。** 同时兼容原有的 jsh_ipban 与新的 jsh_cidrban；显示的是封禁条目数，而不是已经拦截的数据包数。若存在手工写在其他防火墙表中的黑名单，本查询不会收录。
+
+### 3. 解除指定 IP 或网段（混合批量，一行）
+
+~~~bash
+P=40001 IPS="1.2.3.4 27.47.34.0/24" bash -c 'set -euo pipefail; (( EUID==0 )) || { echo "需root权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P<=65535 )) || { echo "端口无效"; exit 1; }; read -r -a A <<< "$IPS"; (( ${#A[@]} > 0 )) || { echo "IP列表为空"; exit 1; }; NETS=$(python3 -B -c "import ipaddress,sys; [print(ipaddress.IPv4Network(s,strict=True)) for s in sys.argv[1:]]" "${A[@]}"); exec 8>/run/jsh-ipban.lock; flock -x 8; exec 9>/run/jsh-cidrban.lock; flock -x 9; N=0; for NET in $NETS; do if [[ $NET == */32 ]] && nft list set inet jsh_ipban banned >/dev/null 2>&1; then IP=${NET%/32}; if nft get element inet jsh_ipban banned "{ $IP . $P }" >/dev/null 2>&1; then nft delete element inet jsh_ipban banned "{ $IP . $P }"; N=$((N+1)); fi; fi; if nft list chain inet jsh_cidrban pre >/dev/null 2>&1; then MARK="jshcidr:$P:$NET"; for H in $(nft -a list chain inet jsh_cidrban pre | grep -F "comment \"$MARK\"" | sed -n "s/.*# handle \([0-9][0-9]*\).*/\1/p" || true); do nft delete rule inet jsh_cidrban pre handle "$H"; N=$((N+1)); done; fi; done; if nft list table inet jsh_ipban >/dev/null 2>&1; then umask 077; nft list table inet jsh_ipban >/etc/jsh-ipban.nft.tmp; mv -f /etc/jsh-ipban.nft.tmp /etc/jsh-ipban.nft; fi; if nft list table inet jsh_cidrban >/dev/null 2>&1; then REM=$(nft -j list chain inet jsh_cidrban pre | python3 -B -c "import json,sys; print(sum(\"rule\" in x for x in json.load(sys.stdin)[\"nftables\"]))"); if [[ $REM == 0 ]]; then systemctl disable jsh-cidrban.service >/dev/null 2>&1 || true; nft delete table inet jsh_cidrban; rm -f /etc/jsh-cidrban.nft /etc/jsh-cidrban.nft.tmp /etc/systemd/system/jsh-cidrban.service; systemctl daemon-reload; else umask 077; nft list table inet jsh_cidrban >/etc/jsh-cidrban.nft.tmp; mv -f /etc/jsh-cidrban.nft.tmp /etc/jsh-cidrban.nft; fi; fi; echo "端口 $P 已解除 $N 条指定封禁；其他端口保持不变"'
+~~~
+
+可同时解封原版 jsh_ipban 中的独立 IPv4 和新版 jsh_cidrban 的独立 IPv4（/32）或 CIDR 网段。只解封 P 对应的规则，不删除其他端口封禁；新表规则清空时会清理新模块的持久化文件和服务。**出于避免误删不受此功能管理的规则考虑，旧版 jsh_ipban 即使元素清空也会保留表及其恢复服务（空表不会实际封禁）。**
+
+### 4. 清空某一个端口的受管理 IP 黑名单（一行）
+
+~~~bash
+P=40001 bash -c 'set -euo pipefail; (( EUID==0 )) || { echo "需root权限"; exit 1; }; [[ $P =~ ^[1-9][0-9]{0,4}$ ]] && (( P<=65535 )) || { echo "端口无效"; exit 1; }; exec 8>/run/jsh-ipban.lock; flock -x 8; exec 9>/run/jsh-cidrban.lock; flock -x 9; OLD=0; NEW=0; if nft list set inet jsh_ipban banned >/dev/null 2>&1; then IPS=$(nft -j list set inet jsh_ipban banned | python3 -B -c "import json,sys,ipaddress; a=[x[\"set\"] for x in json.load(sys.stdin)[\"nftables\"] if \"set\" in x and x[\"set\"].get(\"name\")==\"banned\"]; assert len(a)==1; e=a[0].get(\"elem\",[]); v=[x[\"elem\"][\"val\"] if isinstance(x,dict) and \"elem\" in x else x for x in e]; pairs=[x[\"concat\"] for x in v if isinstance(x,dict) and isinstance(x.get(\"concat\"),list) and len(x[\"concat\"])==2]; assert len(pairs)==len(v),\"元素格式异常\"; [print(ipaddress.IPv4Address(x[0])) for x in pairs if int(x[1])==int(sys.argv[1])]" "$P"); for IP in $IPS; do nft delete element inet jsh_ipban banned "{ $IP . $P }"; OLD=$((OLD+1)); done; umask 077; nft list table inet jsh_ipban >/etc/jsh-ipban.nft.tmp; mv -f /etc/jsh-ipban.nft.tmp /etc/jsh-ipban.nft; fi; if nft list chain inet jsh_cidrban pre >/dev/null 2>&1; then HANDLES=$(nft -j -a list chain inet jsh_cidrban pre | python3 -B -c "import json,sys; a=[x[\"rule\"] for x in json.load(sys.stdin)[\"nftables\"] if \"rule\" in x]; [print(x[\"handle\"]) for x in a if str(x.get(\"comment\",\"\")).startswith(\"jshcidr:\"+sys.argv[1]+\":\")]" "$P"); for H in $HANDLES; do [[ $H =~ ^[0-9]+$ ]] || exit 1; nft delete rule inet jsh_cidrban pre handle "$H"; NEW=$((NEW+1)); done; REM=$(nft -j list chain inet jsh_cidrban pre | python3 -B -c "import json,sys; print(sum(\"rule\" in x for x in json.load(sys.stdin)[\"nftables\"]))"); if [[ $REM == 0 ]]; then systemctl disable jsh-cidrban.service >/dev/null 2>&1 || true; nft delete table inet jsh_cidrban; rm -f /etc/jsh-cidrban.nft /etc/jsh-cidrban.nft.tmp /etc/systemd/system/jsh-cidrban.service; systemctl daemon-reload; else umask 077; nft list table inet jsh_cidrban >/etc/jsh-cidrban.nft.tmp; mv -f /etc/jsh-cidrban.nft.tmp /etc/jsh-cidrban.nft; fi; fi; echo "端口 $P 已清除：原版单IP $OLD 条，混合规则 $NEW 条；其他端口保留"'
+~~~
+
+只清理所填 P 在旧版 jsh_ipban 集合中的独立 IP，以及新版 jsh_cidrban 表中标记为 jshcidr:该端口: 的规则；**不会清空其他端口，也不会碰本 README 第十节的独立整端口暂停规则或 IP_LIMIT 等限制。** 原版表为空时仍会保留空表（避免误删其他未被识别的旧版配置）；新表完全没有剩余规则时会删除自己的表、恢复服务与配置。
+
+### 5. 验证与注意事项
+
+~~~bash
+nft -a list chain inet jsh_cidrban pre
+nft -a list set inet jsh_ipban banned 2>/dev/null
+systemctl is-enabled jsh-cidrban.service
+~~~
+
+- **封禁生效**：规则中的 counter packets / bytes 代表命中的数据包数 / 字节数，不是 TCP 连接数；新增规则不会强制清除已经建立的连接跟踪状态。
+- **重启恢复**：已安装的 jsh-cidrban.service 负责读取保存的规则；当前运行时已核对不等于已经在重启场景验证，重启或防火墙重载后须再查询。
+- **并发安全**：原版和新版有各自的锁；本节解封命令依固定顺序取得两把锁。不要在多台终端同时执行封禁、解封或清空命令；不要手工编辑管理表的规则注释。
+- **适用范围**：只对本机收到的对应端口数据包匹配，可能影响 NAT/转发，勿把大范围网段误当成某个城市的全部地址。规则不覆盖 IPv6。
+- **验证说明**：以上属于 README 操作命令，已核对 Bash 结构及所使用的 nftables 规则格式；GitHub 文档更新不会改变当前服务器。仍需在目标 Debian 12 环境实际验证。
