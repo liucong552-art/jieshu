@@ -974,31 +974,31 @@ NODE_NAME=VLESS-REALITY-IPv4
 
 ### 3. 创建或更新主节点
 
+**安装或更新主节点**：首次创建主节点、修改配置后重新应用，或日常更新 Xray 时执行。已有主节点默认保留原 UUID、Reality 密钥和 Short ID，不会重置连接凭据。
+
 ```bash
 bash /root/onekey_reality_ipv4.sh
 ```
 
-主节点链接：
+**重置 443 主节点**：需要重新生成主节点连接凭据时执行（须已安装本项目的主节点脚本，且配置文件中 `PORT=443`）。此命令会重新生成 UUID、Reality 密钥和 Short ID，并重新部署主节点；**旧的 443 主节点链接会失效，需使用新链接重新导入客户端**。
+
+```bash
+ROTATE_CREDENTIALS=1 bash /root/onekey_reality_ipv4.sh
+```
+
+安装、更新或重置成功后，查看当前主节点链接：
 
 ```bash
 cat /root/vless_reality_vision_url.txt
 ```
 
-修改配置后重新执行主节点脚本即可。默认会保留原 UUID 和 Reality 密钥。
-
 <details>
-<summary>高级选择：固定版本或更换全部主节点凭据（日常无需执行）</summary>
+<summary>高级选择：固定 Xray 版本（日常无需执行）</summary>
 
 仅需固定 Xray 版本时，将 `vX.Y.Z` 换成实际存在的版本号：
 
 ```bash
 XRAY_VERSION=vX.Y.Z bash /root/onekey_reality_ipv4.sh
-```
-
-仅当你明确要更换主节点 UUID 和 Reality 密钥时执行；旧主节点链接会失效，之后需重新分发链接：
-
-```bash
-ROTATE_CREDENTIALS=1 bash /root/onekey_reality_ipv4.sh
 ```
 
 </details>
