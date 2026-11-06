@@ -22,7 +22,7 @@
 | SOCKS5 账号、到期、剩余配额及 IP 占用 | `socks5 list` |
 | SOCKS5 今天 / 某端口每日流量 | `socks5-traffic` / `socks5-traffic 41004`（[说明](#socks5-daily)） |
 | SOCKS5 连接链接 | `socks5 link 41004` |
-| SOCKS5 访问域名与连接错误 | [SOCKS5 审计](#socks5-access) |
+| SOCKS5 使用审计／共享与滥用线索 | [查看审计](#socks5-access) |
 | NAT 出口机运行状态 | 在 NAT 出口机执行 `bash /root/nat.sh status` |
 | 导出有效临时节点订阅（生成文件） | [导出订阅](#subscription) |
 | 配额重置日期、限速采样进度、精确字节等 | [按需补充查询](#advanced-queries) |
@@ -184,7 +184,7 @@ socks5-traffic 41004                # 查看端口 41004 最近 30 天的每日�
 <a id="socks5-access"></a>
 
 <details>
-<summary>SOCKS5 访问审计：概览、全部域名、错误明细</summary>
+<summary>SOCKS5 使用审计／共享与滥用线索</summary>
 
 以下命令按需选用，不必全部执行。端口使用本机监听端口；天数范围 1～90，北京时间显示。域名仅统计成功且含域名的记录；日志通常在连接结束时写入，未记录 / 已清理的历史不能补查。
 
